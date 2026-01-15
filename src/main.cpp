@@ -18,30 +18,29 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
 #include <SensirionI2CScd4x.h>
+#include <Adafruit_MAX1704X.h>
 
 // =============================================================================
 // CONFIGURATION - Adjust these values to customize behavior
 // =============================================================================
 
 // CO2 Thresholds (in ppm)
-#define CO2_THRESHOLD_GREEN   800   // Excellent air quality
-#define CO2_THRESHOLD_YELLOW  1000  // Acceptable, consider ventilating
-#define CO2_THRESHOLD_ORANGE  1500  // Poor, should ventilate
-// Above ORANGE = Red (unhealthy)
+#define CO2_THRESHOLD_GREEN   800   // Excellent
+#define CO2_THRESHOLD_YELLOW  1000  // Acceptable
+#define CO2_THRESHOLD_ORANGE  1400  // Poor
+#define CO2_THRESHOLD_RED     1600  // Unhealthy
 
 // Temperature thresholds (in Celsius)
-#define TEMP_THRESHOLD_COLD   18.0  // Too cold (blue)
-#define TEMP_THRESHOLD_COOL   20.0  // Cool (cyan)
-#define TEMP_THRESHOLD_WARM   25.0  // Warm (yellow)
-#define TEMP_THRESHOLD_HOT    28.0  // Hot (orange)
-// Above HOT = Red
+#define TEMP_THRESHOLD_COLD   18.0  // Too cold
+#define TEMP_THRESHOLD_COOL   20.0  // Cool
+#define TEMP_THRESHOLD_WARM   25.0  // Warm
+#define TEMP_THRESHOLD_HOT    28.0  // Hot
 
 // Humidity thresholds (in %)
-#define HUMID_THRESHOLD_DRY   30.0  // Too dry (orange)
-#define HUMID_THRESHOLD_LOW   40.0  // Low (yellow)
-#define HUMID_THRESHOLD_HIGH  60.0  // High (cyan)
-#define HUMID_THRESHOLD_WET   70.0  // Too wet (blue)
-// Above WET = Purple
+#define HUMID_THRESHOLD_DRY   30.0  // Too low
+#define HUMID_THRESHOLD_LOW   40.0  // Low
+#define HUMID_THRESHOLD_HIGH  60.0  // High
+#define HUMID_THRESHOLD_WET   70.0  // Too high
 
 // Timing Configuration
 #define SENSOR_READ_INTERVAL  300000      // Read sensor every 5 minutes
@@ -107,6 +106,8 @@ enum DisplayMode {
 // TFT_CS, TFT_DC, TFT_RST are defined by the ESP32-S3 Reverse TFT board package
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 SensirionI2CScd4x scd4x;
+Adafruit_MAX17048 batteryMonitor;
+bool batteryMonitorAvailable = false;
 
 // =============================================================================
 // GLOBAL STATE
@@ -145,6 +146,14 @@ DisplayValue prevDisplayValue = DISPLAY_CO2;
 ViewMode prevViewMode = VIEW_NUMBER;
 DisplayMode prevDisplayMode = MODE_ALWAYS_ON;
 
+// Trend tracking (for arrow indicators)
+uint16_t trendCO2 = 0;
+float trendTemperature = 0.0;
+float trendHumidity = 0.0;
+int8_t co2Trend = 0;      // -1 = down, 0 = stable, 1 = up
+int8_t tempTrend = 0;
+int8_t humidTrend = 0;
+
 // =============================================================================
 // FUNCTION DECLARATIONS
 // =============================================================================
@@ -169,6 +178,9 @@ void setDisplayPower(bool on);
 bool shouldDisplayBeOn();
 const char* getDisplayValueName(DisplayValue val);
 const char* getDisplayModeName(DisplayMode mode);
+void updateTrends();
+void drawTrendArrow(int x, int y, int8_t trend, uint16_t color);
+int getBatteryPercent();
 
 // =============================================================================
 // SETUP
@@ -192,7 +204,25 @@ void setup() {
   // Initialize sensor
   initSensor();
 
+  // Initialize battery monitor (MAX17048)
+  if (batteryMonitor.begin()) {
+    batteryMonitorAvailable = true;
+    Serial.println("MAX17048 battery monitor initialized");
+  } else {
+    batteryMonitorAvailable = false;
+    Serial.println("MAX17048 not found, battery display disabled");
+  }
+
+  // Initial sensor read to display values immediately
+  Serial.println("Waiting for first sensor reading...");
+  while (currentCO2 == 0) {
+    readSensor();
+    delay(500);
+  }
+  updateHistory();  // Store first data point
+
   Serial.println("Setup complete!");
+  forceDisplayRefresh = true;
 }
 
 // =============================================================================
@@ -254,14 +284,37 @@ void initDisplay() {
   tft.setRotation(3);  // Landscape mode, USB port on the left
   tft.fillScreen(COLOR_BLACK);
 
-  // Show startup message
+  // Show startup message (centered)
+  // Display is 240x135 pixels
   tft.setTextColor(COLOR_WHITE);
+
+  // "CO₂ Monitor" with subscript 2
+  // "CO" size 2 = 2 chars * 12px = 24px
+  // "2" size 1 = 6px (subscript)
+  // " Monitor" size 2 = 8 chars * 12px = 96px
+  // Total width approx: 24 + 6 + 96 = 126px
+  int startX = (240 - 126) / 2;
+  int baseY = 52;
+
   tft.setTextSize(2);
-  tft.setCursor(40, 50);
-  tft.println("CO2 Monitor");
+  tft.setCursor(startX, baseY);
+  tft.print("CO");
+
+  // Subscript "2" - smaller and lower
   tft.setTextSize(1);
-  tft.setCursor(60, 80);
-  tft.println("Initializing...");
+  tft.setCursor(startX + 24, baseY + 8);  // Lower position for subscript
+  tft.print("2");
+
+  // Continue with " Monitor"
+  tft.setTextSize(2);
+  tft.setCursor(startX + 30, baseY);
+  tft.print(" Monitor");
+
+  // "v0.1" - size 1, 4 chars * 6px = 24px wide
+  tft.setTextColor(COLOR_LIGHT_GRAY);
+  tft.setTextSize(1);
+  tft.setCursor((240 - 24) / 2, 75);
+  tft.print("v0.2");
 
   displayOn = true;
   lastDisplayActivity = millis();
@@ -341,10 +394,45 @@ void readSensor() {
       currentTemperature = temp;
       currentHumidity = humidity;
 
+      // Update trends
+      updateTrends();
+
       Serial.printf("CO2: %d ppm, Temp: %.1f C, Humidity: %.1f %%\n",
                     currentCO2, currentTemperature, currentHumidity);
     }
   }
+}
+
+void updateTrends() {
+  // CO2 trend (threshold: 20 ppm change)
+  if (currentCO2 > trendCO2 + 20) {
+    co2Trend = 1;
+  } else if (currentCO2 < trendCO2 - 20) {
+    co2Trend = -1;
+  } else {
+    co2Trend = 0;
+  }
+  trendCO2 = currentCO2;
+
+  // Temperature trend (threshold: 0.3°C change)
+  if (currentTemperature > trendTemperature + 0.3) {
+    tempTrend = 1;
+  } else if (currentTemperature < trendTemperature - 0.3) {
+    tempTrend = -1;
+  } else {
+    tempTrend = 0;
+  }
+  trendTemperature = currentTemperature;
+
+  // Humidity trend (threshold: 2% change)
+  if (currentHumidity > trendHumidity + 2.0) {
+    humidTrend = 1;
+  } else if (currentHumidity < trendHumidity - 2.0) {
+    humidTrend = -1;
+  } else {
+    humidTrend = 0;
+  }
+  trendHumidity = currentHumidity;
 }
 
 void updateHistory() {
@@ -401,53 +489,52 @@ void updateDisplay() {
 
 void drawNumberView() {
   // Screen layout (240x135):
-  // - Main value: centered, large font (y: 5-75)
-  // - Secondary values: bottom area with labels (y: 80-110)
-  // - Status bar: very bottom (y: 120-135)
+  // - Status bar: top (y: 0-17)
+  // - Main value + unit: left-aligned (y: 25-75)
+  // - Trend arrow: right-aligned
+  // - Secondary values: bottom (y: 95-125)
 
-  // Clear main display area (not status bar)
-  tft.fillRect(0, 0, 240, 118, COLOR_BLACK);
+  // Clear main display area (below status bar)
+  tft.fillRect(0, 18, 240, 117, COLOR_BLACK);
 
-  // Draw the main big number centered
+  // Draw the main big number left-aligned
   char valueStr[16];
   char unitStr[8];
   uint16_t color;
-  int textSize;
+  int8_t trend;
+
+  // Use consistent font size 7 for all values
+  int textSize = 7;
 
   switch (currentDisplayValue) {
     case DISPLAY_CO2:
       snprintf(valueStr, sizeof(valueStr), "%d", currentCO2);
       snprintf(unitStr, sizeof(unitStr), "ppm");
       color = getCO2Color(currentCO2);
-      textSize = 7;
+      trend = co2Trend;
       break;
     case DISPLAY_TEMPERATURE:
       snprintf(valueStr, sizeof(valueStr), "%.1f", currentTemperature);
       snprintf(unitStr, sizeof(unitStr), "C");
       color = getTemperatureColor(currentTemperature);
-      textSize = 6;
+      trend = tempTrend;
       break;
     case DISPLAY_HUMIDITY:
       snprintf(valueStr, sizeof(valueStr), "%.0f", currentHumidity);
       snprintf(unitStr, sizeof(unitStr), "%%");
       color = getHumidityColor(currentHumidity);
-      textSize = 7;
+      trend = humidTrend;
       break;
     default:
       return;
   }
 
-  // Calculate centering for main value
-  tft.setTextSize(textSize);
-  int charWidth = 6 * textSize;  // Base char width is 6 pixels
-  int valueWidth = strlen(valueStr) * charWidth;
+  // Left-aligned main value with more top spacing (below status bar)
+  int startX = 10;
+  int valueY = 32;
 
-  tft.setTextSize(2);
-  int unitWidth = strlen(unitStr) * 12;
-
-  int totalWidth = valueWidth + 8 + unitWidth;
-  int startX = (240 - totalWidth) / 2;
-  int valueY = 15;
+  // Adafruit GFX font: 7 pixels tall at size 1, 6 pixels wide
+  int valueHeight = 7 * textSize;  // Height of big value in pixels
 
   // Draw main value
   tft.setTextColor(color);
@@ -455,14 +542,55 @@ void drawNumberView() {
   tft.setCursor(startX, valueY);
   tft.print(valueStr);
 
-  // Draw unit (vertically centered with the number)
-  tft.setTextSize(2);
-  int unitY = valueY + (textSize * 8) / 2 - 8;
+  // Calculate where value ends
+  int charWidth = 6 * textSize;
+  int valueWidth = strlen(valueStr) * charWidth;
+
+  // Draw unit on same line, aligned with bottom of big number
+  int unitSize = 2;
+  int unitHeight = 7 * unitSize;  // Height of unit text
+  int unitY = valueY + valueHeight - unitHeight;  // Align bottoms
+  tft.setTextSize(unitSize);
   tft.setCursor(startX + valueWidth + 8, unitY);
   tft.print(unitStr);
 
-  // Draw secondary values at bottom
+  // Draw trend arrow right-aligned, aligned with TOP of big value
+  int arrowX = 215;  // Right side of screen
+  int arrowY = valueY + 12;  // Align with top of big value
+  drawTrendArrow(arrowX, arrowY, trend, color);
+
+  // Draw secondary values at bottom with more spacing
   drawSmallValues();
+}
+
+void drawTrendArrow(int x, int y, int8_t trend, uint16_t color) {
+  if (trend == 0) {
+    // No change - draw horizontal line/dash
+    tft.drawFastHLine(x, y, 20, COLOR_DARK_GRAY);
+    return;
+  }
+
+  // Arrow size
+  int arrowHeight = 16;
+  int arrowWidth = 12;
+
+  if (trend > 0) {
+    // Up arrow
+    tft.fillTriangle(
+      x + arrowWidth/2, y - arrowHeight/2,      // Top point
+      x, y + arrowHeight/2,                      // Bottom left
+      x + arrowWidth, y + arrowHeight/2,         // Bottom right
+      color
+    );
+  } else {
+    // Down arrow
+    tft.fillTriangle(
+      x + arrowWidth/2, y + arrowHeight/2,      // Bottom point
+      x, y - arrowHeight/2,                      // Top left
+      x + arrowWidth, y - arrowHeight/2,         // Top right
+      color
+    );
+  }
 }
 
 void drawBigNumber(int value, const char* unit, uint16_t color) {
@@ -476,121 +604,83 @@ void drawBigNumberFloat(float value, const char* unit, uint16_t color) {
 }
 
 void drawSmallValues() {
-  // Draw secondary readings in a nice two-column layout
-  int yPos = 85;
-  int leftX = 20;
-  int rightX = 130;
+  // Draw secondary readings: left-aligned on left, right-aligned on right
+  // Position lower with more spacing from big value
+  int yPos = 100;
+  int leftX = 10;
+  int rightMargin = 230;  // Right edge for right-aligned text
 
-  tft.setTextSize(2);
+  char leftValue[16];
+  char leftLabel[16];
+  char rightValue[16];
+  char rightLabel[16];
+  uint16_t leftColor, rightColor;
 
   // Determine which two values to show (the ones not currently selected as main)
-  if (currentDisplayValue != DISPLAY_CO2) {
-    // Show CO2 on the left or right depending on what else is shown
-    if (currentDisplayValue == DISPLAY_TEMPERATURE) {
-      // Main is Temp, show CO2 left, Humidity right
-      tft.setTextColor(getCO2Color(currentCO2));
-      tft.setCursor(leftX, yPos);
-      tft.printf("%d", currentCO2);
-      tft.setTextSize(1);
-      tft.setCursor(leftX, yPos + 18);
-      tft.print("CO2 ppm");
-
-      tft.setTextSize(2);
-      tft.setTextColor(getHumidityColor(currentHumidity));
-      tft.setCursor(rightX, yPos);
-      tft.printf("%.0f%%", currentHumidity);
-      tft.setTextSize(1);
-      tft.setCursor(rightX, yPos + 18);
-      tft.print("Humidity");
-    } else {
-      // Main is Humidity, show CO2 left, Temp right
-      tft.setTextColor(getCO2Color(currentCO2));
-      tft.setCursor(leftX, yPos);
-      tft.printf("%d", currentCO2);
-      tft.setTextSize(1);
-      tft.setCursor(leftX, yPos + 18);
-      tft.print("CO2 ppm");
-
-      tft.setTextSize(2);
-      tft.setTextColor(getTemperatureColor(currentTemperature));
-      tft.setCursor(rightX, yPos);
-      tft.printf("%.1f C", currentTemperature);
-      tft.setTextSize(1);
-      tft.setCursor(rightX, yPos + 18);
-      tft.print("Temp");
-    }
-  } else {
+  if (currentDisplayValue == DISPLAY_CO2) {
     // Main is CO2, show Temp left, Humidity right
-    tft.setTextColor(getTemperatureColor(currentTemperature));
-    tft.setCursor(leftX, yPos);
-    tft.printf("%.1f C", currentTemperature);
-    tft.setTextSize(1);
-    tft.setCursor(leftX, yPos + 18);
-    tft.print("Temp");
+    snprintf(leftValue, sizeof(leftValue), "%.1f C", currentTemperature);
+    snprintf(leftLabel, sizeof(leftLabel), "Temp");
+    leftColor = getTemperatureColor(currentTemperature);
 
-    tft.setTextSize(2);
-    tft.setTextColor(getHumidityColor(currentHumidity));
-    tft.setCursor(rightX, yPos);
-    tft.printf("%.0f%%", currentHumidity);
-    tft.setTextSize(1);
-    tft.setCursor(rightX, yPos + 18);
-    tft.print("Humidity");
+    snprintf(rightValue, sizeof(rightValue), "%.0f%%", currentHumidity);
+    snprintf(rightLabel, sizeof(rightLabel), "Humidity");
+    rightColor = getHumidityColor(currentHumidity);
+  } else if (currentDisplayValue == DISPLAY_TEMPERATURE) {
+    // Main is Temp, show CO2 left, Humidity right
+    snprintf(leftValue, sizeof(leftValue), "%d", currentCO2);
+    snprintf(leftLabel, sizeof(leftLabel), "CO2 ppm");
+    leftColor = getCO2Color(currentCO2);
+
+    snprintf(rightValue, sizeof(rightValue), "%.0f%%", currentHumidity);
+    snprintf(rightLabel, sizeof(rightLabel), "Humidity");
+    rightColor = getHumidityColor(currentHumidity);
+  } else {
+    // Main is Humidity, show CO2 left, Temp right
+    snprintf(leftValue, sizeof(leftValue), "%d", currentCO2);
+    snprintf(leftLabel, sizeof(leftLabel), "CO2 ppm");
+    leftColor = getCO2Color(currentCO2);
+
+    snprintf(rightValue, sizeof(rightValue), "%.1f C", currentTemperature);
+    snprintf(rightLabel, sizeof(rightLabel), "Temp");
+    rightColor = getTemperatureColor(currentTemperature);
   }
+
+  // Draw left value (left-aligned)
+  tft.setTextSize(2);
+  tft.setTextColor(leftColor);
+  tft.setCursor(leftX, yPos);
+  tft.print(leftValue);
+  tft.setTextSize(1);
+  tft.setCursor(leftX, yPos + 18);
+  tft.print(leftLabel);
+
+  // Draw right value (right-aligned)
+  tft.setTextSize(2);
+  int rightValueWidth = strlen(rightValue) * 12;
+  tft.setTextColor(rightColor);
+  tft.setCursor(rightMargin - rightValueWidth, yPos);
+  tft.print(rightValue);
+  tft.setTextSize(1);
+  int rightLabelWidth = strlen(rightLabel) * 6;
+  tft.setCursor(rightMargin - rightLabelWidth, yPos + 18);
+  tft.print(rightLabel);
 }
 
 void drawGraphView() {
-  // Clear display area (except status bar)
-  tft.fillRect(0, 0, 240, 118, COLOR_BLACK);
+  // Clear display area (below status bar at top)
+  tft.fillRect(0, 18, 240, 117, COLOR_BLACK);
 
-  // Header: "CO2" on left, current value on right
-  tft.setTextSize(1);
-  tft.setTextColor(COLOR_LIGHT_GRAY);
-  tft.setCursor(5, 4);
-  tft.print(getDisplayValueName(currentDisplayValue));
-  tft.print(" - 24h (from 6:00)");
-
-  // Draw current value on right side - clear area first and use proper formatting
-  char valueStr[16];
-  uint16_t valueColor;
-
-  switch (currentDisplayValue) {
-    case DISPLAY_CO2:
-      snprintf(valueStr, sizeof(valueStr), "%d ppm", currentCO2);
-      valueColor = getCO2Color(currentCO2);
-      break;
-    case DISPLAY_TEMPERATURE:
-      snprintf(valueStr, sizeof(valueStr), "%.1f C", currentTemperature);
-      valueColor = getTemperatureColor(currentTemperature);
-      break;
-    case DISPLAY_HUMIDITY:
-      snprintf(valueStr, sizeof(valueStr), "%.0f %%", currentHumidity);
-      valueColor = getHumidityColor(currentHumidity);
-      break;
-    default:
-      valueStr[0] = '\0';
-      valueColor = COLOR_WHITE;
-      break;
-  }
-
-  // Right-align the current value
-  tft.setTextSize(2);
-  int valueWidth = strlen(valueStr) * 12;
-  tft.setTextColor(valueColor);
-  tft.setCursor(235 - valueWidth, 2);
-  tft.print(valueStr);
-
+  // No header text - maximize graph area
   drawGraph();
 }
 
 void drawGraph() {
-  // Graph area - adjusted to fit with status bar
-  int graphX = 22;
-  int graphY = 20;
-  int graphWidth = 195;
-  int graphHeight = 75;
-
-  // Draw graph border
-  tft.drawRect(graphX - 1, graphY - 1, graphWidth + 2, graphHeight + 2, COLOR_DARK_GRAY);
+  // Graph area - use full width, no border, more space under status bar
+  int graphX = 5;
+  int graphY = 26;         // Start below status bar with padding
+  int graphWidth = 230;    // Use full width (labels inside)
+  int graphHeight = 106;   // Fill remaining vertical space
 
   // Find min/max for scaling
   float minVal = 0, maxVal = 0;
@@ -598,7 +688,7 @@ void drawGraph() {
   switch (currentDisplayValue) {
     case DISPLAY_CO2:
       minVal = 400;  // CO2 rarely goes below 400
-      maxVal = 2000; // Cap at 2000 for scale
+      maxVal = 2500; // Cap at 2500 for scale
       for (int i = 0; i < historyCount; i++) {
         if (historyC02[i] > maxVal) maxVal = historyC02[i];
       }
@@ -615,11 +705,12 @@ void drawGraph() {
       break;
   }
 
-  // Draw threshold lines for CO2
+  // Always draw threshold lines (thin, colored)
   if (currentDisplayValue == DISPLAY_CO2) {
     int yGreen = graphY + graphHeight - (int)(((CO2_THRESHOLD_GREEN - minVal) / (maxVal - minVal)) * graphHeight);
     int yYellow = graphY + graphHeight - (int)(((CO2_THRESHOLD_YELLOW - minVal) / (maxVal - minVal)) * graphHeight);
     int yOrange = graphY + graphHeight - (int)(((CO2_THRESHOLD_ORANGE - minVal) / (maxVal - minVal)) * graphHeight);
+    int yRed = graphY + graphHeight - (int)(((CO2_THRESHOLD_RED - minVal) / (maxVal - minVal)) * graphHeight);
 
     if (yGreen > graphY && yGreen < graphY + graphHeight) {
       tft.drawFastHLine(graphX, yGreen, graphWidth, COLOR_GREEN);
@@ -630,10 +721,39 @@ void drawGraph() {
     if (yOrange > graphY && yOrange < graphY + graphHeight) {
       tft.drawFastHLine(graphX, yOrange, graphWidth, COLOR_ORANGE);
     }
+    if (yRed > graphY && yRed < graphY + graphHeight) {
+      tft.drawFastHLine(graphX, yRed, graphWidth, COLOR_RED);
+    }
+  } else if (currentDisplayValue == DISPLAY_TEMPERATURE) {
+    // Temperature thresholds
+    int yCool = graphY + graphHeight - (int)(((TEMP_THRESHOLD_COOL - minVal) / (maxVal - minVal)) * graphHeight);
+    int yWarm = graphY + graphHeight - (int)(((TEMP_THRESHOLD_WARM - minVal) / (maxVal - minVal)) * graphHeight);
+    int yHot = graphY + graphHeight - (int)(((TEMP_THRESHOLD_HOT - minVal) / (maxVal - minVal)) * graphHeight);
+
+    if (yCool > graphY && yCool < graphY + graphHeight) {
+      tft.drawFastHLine(graphX, yCool, graphWidth, COLOR_CYAN);
+    }
+    if (yWarm > graphY && yWarm < graphY + graphHeight) {
+      tft.drawFastHLine(graphX, yWarm, graphWidth, COLOR_YELLOW);
+    }
+    if (yHot > graphY && yHot < graphY + graphHeight) {
+      tft.drawFastHLine(graphX, yHot, graphWidth, COLOR_ORANGE);
+    }
+  } else if (currentDisplayValue == DISPLAY_HUMIDITY) {
+    // Humidity thresholds
+    int yLow = graphY + graphHeight - (int)(((HUMID_THRESHOLD_LOW - minVal) / (maxVal - minVal)) * graphHeight);
+    int yHigh = graphY + graphHeight - (int)(((HUMID_THRESHOLD_HIGH - minVal) / (maxVal - minVal)) * graphHeight);
+
+    if (yLow > graphY && yLow < graphY + graphHeight) {
+      tft.drawFastHLine(graphX, yLow, graphWidth, COLOR_YELLOW);
+    }
+    if (yHigh > graphY && yHigh < graphY + graphHeight) {
+      tft.drawFastHLine(graphX, yHigh, graphWidth, COLOR_CYAN);
+    }
   }
 
-  // Draw the graph line (always draw what we have, even if just 1 point)
-  if (historyCount > 0) {
+  // Draw the graph line in white (always a line, no dots)
+  if (historyCount > 1) {
     float xStep = (float)graphWidth / (GRAPH_POINTS - 1);
 
     for (int i = 1; i < historyCount; i++) {
@@ -642,27 +762,22 @@ void drawGraph() {
       int idx1 = (historyIndex - historyCount + i + GRAPH_POINTS) % GRAPH_POINTS;
 
       float val0, val1;
-      uint16_t color;
 
       switch (currentDisplayValue) {
         case DISPLAY_CO2:
           val0 = historyC02[idx0];
           val1 = historyC02[idx1];
-          color = getCO2Color((uint16_t)val1);
           break;
         case DISPLAY_TEMPERATURE:
           val0 = historyTemperature[idx0];
           val1 = historyTemperature[idx1];
-          color = getTemperatureColor(val1);
           break;
         case DISPLAY_HUMIDITY:
           val0 = historyHumidity[idx0];
           val1 = historyHumidity[idx1];
-          color = getHumidityColor(val1);
           break;
         default:
           val0 = val1 = 0;
-          color = COLOR_WHITE;
           break;
       }
 
@@ -676,134 +791,149 @@ void drawGraph() {
       y0 = constrain(y0, graphY, graphY + graphHeight);
       y1 = constrain(y1, graphY, graphY + graphHeight);
 
-      tft.drawLine(x0, y0, x1, y1, color);
-    }
-
-    // If we only have one point, draw it as a dot
-    if (historyCount == 1) {
-      int idx = (historyIndex - 1 + GRAPH_POINTS) % GRAPH_POINTS;
-      float val;
-      uint16_t color;
-
-      switch (currentDisplayValue) {
-        case DISPLAY_CO2:
-          val = historyC02[idx];
-          color = getCO2Color((uint16_t)val);
-          break;
-        case DISPLAY_TEMPERATURE:
-          val = historyTemperature[idx];
-          color = getTemperatureColor(val);
-          break;
-        case DISPLAY_HUMIDITY:
-          val = historyHumidity[idx];
-          color = getHumidityColor(val);
-          break;
-        default:
-          val = 0;
-          color = COLOR_WHITE;
-          break;
-      }
-
-      int y = graphY + graphHeight - (int)(((val - minVal) / (maxVal - minVal)) * graphHeight);
-      y = constrain(y, graphY, graphY + graphHeight);
-      tft.fillCircle(graphX, y, 2, color);
+      // Always draw white line
+      tft.drawLine(x0, y0, x1, y1, COLOR_WHITE);
     }
   }
 
-  // Draw scale labels on the right
-  tft.setTextColor(COLOR_LIGHT_GRAY);
-  tft.setTextSize(1);
-  tft.setCursor(graphX + graphWidth + 3, graphY);
-  tft.printf("%.0f", maxVal);
-  tft.setCursor(graphX + graphWidth + 3, graphY + graphHeight - 8);
-  tft.printf("%.0f", minVal);
-
-  // Draw time labels - 6:00 to 6:00 (24h period)
-  tft.setCursor(graphX, graphY + graphHeight + 3);
-  tft.print("6:00");
-  tft.setCursor(graphX + graphWidth - 24, graphY + graphHeight + 3);
-  tft.print("6:00");
-
-  // Draw data point count indicator
+  // Draw scale labels INSIDE the graph (top-right and bottom-right corners)
   tft.setTextColor(COLOR_DARK_GRAY);
-  tft.setCursor(graphX + graphWidth/2 - 15, graphY + graphHeight + 3);
-  tft.printf("%d pts", historyCount);
+  tft.setTextSize(1);
+
+  // Max value label (top-right inside graph)
+  char maxLabel[10];
+  snprintf(maxLabel, sizeof(maxLabel), "%.0f", maxVal);
+  int maxLabelWidth = strlen(maxLabel) * 6;
+  tft.setCursor(graphX + graphWidth - maxLabelWidth - 3, graphY + 3);
+  tft.print(maxLabel);
+
+  // Min value label (bottom-right inside graph)
+  char minLabel[10];
+  snprintf(minLabel, sizeof(minLabel), "%.0f", minVal);
+  int minLabelWidth = strlen(minLabel) * 6;
+  tft.setCursor(graphX + graphWidth - minLabelWidth - 3, graphY + graphHeight - 11);
+  tft.print(minLabel);
+
+  // Datapoint counter (bottom-left inside graph)
+  char countLabel[16];
+  snprintf(countLabel, sizeof(countLabel), "n=%d", historyCount);
+  tft.setCursor(graphX + 3, graphY + graphHeight - 11);
+  tft.print(countLabel);
 }
 
 void drawStatusBar() {
-  // Status bar at bottom (y: 118-135, height: 17px)
-  int yPos = 118;
+  // Status bar at TOP (y: 0-17, height: 17px)
+  int yPos = 0;
   int barHeight = 17;
 
-  // Draw background
-  tft.fillRect(0, yPos, 240, barHeight, COLOR_DARK_GRAY);
-
-  // Draw a subtle top border
-  tft.drawFastHLine(0, yPos, 240, COLOR_LIGHT_GRAY);
-
-  // Three sections: Mode | View | Value
-  // Each section is ~80px wide
+  // Black background (no border)
+  tft.fillRect(0, yPos, 240, barHeight, COLOR_BLACK);
 
   tft.setTextSize(1);
   int textY = yPos + 5;
 
-  // Section 1: Display mode (Always On / Warn)
-  if (currentDisplayMode == MODE_ALWAYS_ON) {
-    tft.setTextColor(COLOR_GREEN);
-    tft.setCursor(8, textY);
-    tft.print("ALWAYS ON");
-  } else {
-    tft.setTextColor(COLOR_YELLOW);
-    tft.setCursor(8, textY);
-    tft.print("WARN MODE");
-  }
-
-  // Draw separator
-  tft.drawFastVLine(80, yPos + 3, barHeight - 6, COLOR_LIGHT_GRAY);
-
-  // Section 2: View mode (Number / Graph)
-  tft.setTextColor(COLOR_WHITE);
-  tft.setCursor(95, textY);
-  if (currentViewMode == VIEW_NUMBER) {
-    tft.print("VALUE");
-  } else {
-    tft.print("GRAPH");
-  }
-
-  // Draw separator
-  tft.drawFastVLine(160, yPos + 3, barHeight - 6, COLOR_LIGHT_GRAY);
-
-  // Section 3: Current measurement type with color indicator
-  int indicatorX = 172;
-  uint16_t indicatorColor;
-  const char* label;
+  // Left: Colored dot + metric label (white text)
+  uint16_t metricColor;
+  const char* metricLabel;
 
   switch (currentDisplayValue) {
     case DISPLAY_CO2:
-      indicatorColor = getCO2Color(currentCO2);
-      label = "CO2";
+      metricColor = getCO2Color(currentCO2);
+      metricLabel = "CO2";
       break;
     case DISPLAY_TEMPERATURE:
-      indicatorColor = COLOR_WHITE;
-      label = "TEMP";
+      metricColor = COLOR_WHITE;
+      metricLabel = "TEMP";
       break;
     case DISPLAY_HUMIDITY:
-      indicatorColor = COLOR_CYAN;
-      label = "HUMID";
+      metricColor = COLOR_CYAN;
+      metricLabel = "HUMID";
       break;
     default:
-      indicatorColor = COLOR_WHITE;
-      label = "";
+      metricColor = COLOR_WHITE;
+      metricLabel = "";
       break;
   }
 
-  // Draw color dot indicator
-  tft.fillCircle(indicatorX, yPos + barHeight/2, 4, indicatorColor);
+  // Draw colored dot indicator
+  tft.fillCircle(10, yPos + barHeight/2, 4, metricColor);
 
-  // Draw label
+  // Draw metric label in white
   tft.setTextColor(COLOR_WHITE);
-  tft.setCursor(indicatorX + 10, textY);
-  tft.print(label);
+  tft.setCursor(20, textY);
+  tft.print(metricLabel);
+
+  // Center: Power mode (light grey)
+  const char* modeLabel;
+  if (currentDisplayMode == MODE_ALWAYS_ON) {
+    modeLabel = "ALWAYS ON";
+  } else {
+    modeLabel = "WARN";
+  }
+
+  int modeWidth = strlen(modeLabel) * 6;
+  tft.setTextColor(COLOR_LIGHT_GRAY);
+  tft.setCursor(120 - modeWidth/2, textY);
+  tft.print(modeLabel);
+
+  // Right: Battery icon + percentage
+  int batteryPercent = getBatteryPercent();
+  char batteryStr[8];
+  uint16_t batteryColor;
+
+  if (batteryPercent >= 0) {
+    snprintf(batteryStr, sizeof(batteryStr), "%d%%", batteryPercent);
+    // Color based on battery level
+    if (batteryPercent > 50) {
+      batteryColor = COLOR_GREEN;
+    } else if (batteryPercent > 20) {
+      batteryColor = COLOR_YELLOW;
+    } else {
+      batteryColor = COLOR_RED;
+    }
+  } else {
+    // No battery / USB powered
+    snprintf(batteryStr, sizeof(batteryStr), "USB");
+    batteryColor = COLOR_LIGHT_GRAY;
+  }
+
+  // Draw battery icon (small rectangle with nub)
+  int batteryIconX = 190;
+  int batteryIconY = yPos + 4;
+  int batteryIconW = 14;
+  int batteryIconH = 8;
+
+  // Battery outline
+  tft.drawRect(batteryIconX, batteryIconY, batteryIconW, batteryIconH, batteryColor);
+  // Battery nub (positive terminal)
+  tft.fillRect(batteryIconX + batteryIconW, batteryIconY + 2, 2, 4, batteryColor);
+
+  // Fill based on percentage
+  if (batteryPercent >= 0) {
+    int fillWidth = (batteryIconW - 2) * batteryPercent / 100;
+    if (fillWidth > 0) {
+      tft.fillRect(batteryIconX + 1, batteryIconY + 1, fillWidth, batteryIconH - 2, batteryColor);
+    }
+  }
+
+  // Draw battery text
+  tft.setTextColor(COLOR_WHITE);
+  tft.setCursor(210, textY);
+  tft.print(batteryStr);
+}
+
+int getBatteryPercent() {
+  // Use MAX17048 battery fuel gauge if available
+  if (batteryMonitorAvailable) {
+    float percent = batteryMonitor.cellPercent();
+    // Clamp to 0-100
+    if (percent > 100) percent = 100;
+    if (percent < 0) percent = 0;
+    return (int)percent;
+  }
+
+  // No battery monitor available - return -1 to indicate USB power
+  return -1;
 }
 
 // =============================================================================
@@ -818,13 +948,21 @@ uint16_t getCO2Color(uint16_t co2) {
 }
 
 uint16_t getTemperatureColor(float temp) {
-  (void)temp;  // Temperature always displayed in white
-  return COLOR_WHITE;
+  // Diverging scale: blue (cold) -> cyan -> WHITE (optimal) -> yellow -> orange -> red (hot)
+  if (temp < TEMP_THRESHOLD_COLD) return COLOR_BLUE;
+  if (temp < TEMP_THRESHOLD_COOL) return COLOR_CYAN;
+  if (temp <= TEMP_THRESHOLD_WARM) return COLOR_WHITE;  // Optimal range
+  if (temp <= TEMP_THRESHOLD_HOT) return COLOR_YELLOW;
+  return COLOR_ORANGE;
 }
 
 uint16_t getHumidityColor(float humidity) {
-  (void)humidity;  // Humidity always displayed in blue
-  return COLOR_CYAN;
+  // Diverging scale: orange (dry) -> yellow -> WHITE (optimal) -> cyan -> blue (wet)
+  if (humidity < HUMID_THRESHOLD_DRY) return COLOR_ORANGE;
+  if (humidity < HUMID_THRESHOLD_LOW) return COLOR_YELLOW;
+  if (humidity <= HUMID_THRESHOLD_HIGH) return COLOR_WHITE;  // Optimal range
+  if (humidity <= HUMID_THRESHOLD_WET) return COLOR_CYAN;
+  return COLOR_BLUE;
 }
 
 // =============================================================================

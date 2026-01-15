@@ -2,11 +2,14 @@
 
 A firmware for monitoring indoor air quality using the Adafruit ESP32-S3 Reverse TFT Feather and SCD-41 CO2 sensor.
 
+**Version:** 0.1
+
 ## Hardware Required
 
 - [Adafruit ESP32-S3 Reverse TFT Feather](https://www.adafruit.com/product/5691)
 - [Adafruit SCD-41 CO2 Sensor](https://www.adafruit.com/product/5190) (STEMMA QT / I2C)
 - STEMMA QT cable (included with sensor)
+- LiPo battery (optional, for portable use)
 
 ## Wiring
 
@@ -15,33 +18,91 @@ Connect the SCD-41 to the ESP32-S3 Reverse TFT Feather using the STEMMA QT conne
 ## Features
 
 - **Real-time monitoring** of CO2, Temperature, and Humidity
-- **Color-coded thresholds** for quick visual assessment
-- **24-hour history graph** (120 data points, sampled every 12 minutes)
-- **Three display modes** controlled via buttons
+- **Color-coded CO2 thresholds** for quick visual assessment
+- **Trend indicators** showing if values are rising or falling
+- **24-hour history graph** with threshold lines
+- **Battery monitoring** with MAX17048 fuel gauge
+- **Smart display refresh** - only updates when values change (no flicker)
 - **Power saving warn mode** - display activates only when thresholds exceeded
+
+## Display Colors
+
+All metrics use color-coded thresholds with diverging scales for temperature and humidity (white = optimal).
+
+| Metric      | Color Scale |
+|-------------|-------------|
+| CO2         | Green → Yellow → Orange → Red (sequential) |
+| Temperature | Blue → Cyan → **White** → Yellow → Orange (diverging) |
+| Humidity    | Orange → Yellow → **White** → Cyan → Blue (diverging) |
 
 ## CO2 Thresholds
 
-| Level  | CO2 (ppm) | Meaning                        |
-|--------|-----------|--------------------------------|
-| Green  | < 800     | Excellent air quality          |
+| Level  | CO2 (ppm) | Meaning                          |
+|--------|-----------|----------------------------------|
+| Green  | < 800     | Excellent air quality            |
 | Yellow | 800-1000  | Acceptable, consider ventilating |
-| Orange | 1000-1500 | Poor, should ventilate         |
+| Orange | 1000-1500 | Poor, should ventilate           |
 | Red    | > 1500    | Unhealthy, ventilate immediately |
+
+## Temperature Thresholds
+
+| Color  | Temperature (°C) | Meaning        |
+|--------|------------------|----------------|
+| Blue   | < 18             | Too cold       |
+| Cyan   | 18-20            | Cool           |
+| White  | 20-25            | Optimal        |
+| Yellow | 25-28            | Warm           |
+| Orange | > 28             | Too hot        |
+
+## Humidity Thresholds
+
+| Color  | Humidity (%) | Meaning        |
+|--------|--------------|----------------|
+| Orange | < 30         | Too dry        |
+| Yellow | 30-40        | Low            |
+| White  | 40-60        | Optimal        |
+| Cyan   | 60-70        | High           |
+| Blue   | > 70         | Too wet        |
 
 ## Button Functions
 
-| Button | Function                                    |
-|--------|---------------------------------------------|
+| Button    | Function                                       |
+|-----------|------------------------------------------------|
 | D0 (Boot) | Cycle displayed value: CO2 -> Temp -> Humidity |
-| D1     | Toggle view: Number <-> Graph               |
-| D2     | Toggle mode: Always On <-> Warn Mode        |
+| D1        | Toggle view: Number <-> Graph                  |
+| D2        | Toggle mode: Always On <-> Warn Mode           |
 
 ### Warn Mode
 
 In warn mode, the display turns off when CO2 levels are acceptable (<800 ppm). It automatically turns on when:
 - CO2 exceeds the yellow threshold (800 ppm)
 - Any button is pressed (temporary wake for 10 seconds)
+
+## Display Layout
+
+### Number View
+```
++-----------------------------------------+
+| [*] CO2    ALWAYS ON        [===] 85%   |  <- Status bar (top)
+|                                         |
+|   1234 ppm                        ^     |  <- Big value + unit + trend
+|                                         |
+|   23.5 C                       45%      |  <- Secondary values
+|   Temp                      Humidity    |
++-----------------------------------------+
+```
+
+### Graph View
+```
++-----------------------------------------+
+| [*] CO2    ALWAYS ON        [===] 85%   |  <- Status bar (top)
+|                                         |
+|   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~    2500  |  <- Graph with threshold
+|   ----------------------------          |     lines and scale
+|   ============================          |
+|   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~     400  |
++-----------------------------------------+
+```
 
 ## Installation
 
@@ -83,8 +144,9 @@ In warn mode, the display turns off when CO2 levels are acceptable (<800 ppm). I
 3. Install required libraries via Library Manager:
    - Adafruit GFX Library
    - Adafruit ST7735 and ST7789 Library
-   - Adafruit SCD4x
+   - Sensirion I2C SCD4x
    - Adafruit BusIO
+   - Adafruit MAX1704X
 
 4. Select board: Tools -> Board -> ESP32 Arduino -> Adafruit Feather ESP32-S3 Reverse TFT
 
@@ -101,48 +163,24 @@ Edit the `#define` values at the top of `src/main.cpp` to customize:
 #define CO2_THRESHOLD_GREEN   800
 #define CO2_THRESHOLD_YELLOW  1000
 #define CO2_THRESHOLD_ORANGE  1500
+#define CO2_THRESHOLD_RED     2000
 
-// Temperature thresholds (in Celsius)
+// Temperature thresholds (in Celsius) - diverging scale, white center
 #define TEMP_THRESHOLD_COLD   18.0
-#define TEMP_THRESHOLD_COOL   20.0
-#define TEMP_THRESHOLD_WARM   25.0
+#define TEMP_THRESHOLD_COOL   20.0   // Lower bound of optimal (white)
+#define TEMP_THRESHOLD_WARM   25.0   // Upper bound of optimal (white)
 #define TEMP_THRESHOLD_HOT    28.0
 
-// Humidity thresholds (in %)
+// Humidity thresholds (in %) - diverging scale, white center
 #define HUMID_THRESHOLD_DRY   30.0
-#define HUMID_THRESHOLD_LOW   40.0
-#define HUMID_THRESHOLD_HIGH  60.0
+#define HUMID_THRESHOLD_LOW   40.0   // Lower bound of optimal (white)
+#define HUMID_THRESHOLD_HIGH  60.0   // Upper bound of optimal (white)
 #define HUMID_THRESHOLD_WET   70.0
 
 // Timing
-#define SENSOR_READ_INTERVAL  5000      // Read sensor every 5 seconds
+#define SENSOR_READ_INTERVAL  300000    // Read sensor every 5 minutes
 #define GRAPH_SAMPLE_INTERVAL 720000    // Graph point every 12 minutes
 #define DISPLAY_TIMEOUT       10000     // Warn mode display timeout
-```
-
-## Display Layout
-
-### Number View
-```
-+------------------------+
-|        1234            |  <- Big colored number
-|         ppm            |
-|                        |
-| Temp: 23.5C  Humid: 45%|  <- Small secondary values
-|[ALWAYS ON] [NUM] [CO2] |  <- Status bar
-+------------------------+
-```
-
-### Graph View
-```
-+------------------------+
-| CO2 - 24h History 1234 |
-| +------------------+   |
-| |    ~~~graph~~~   |   |
-| +------------------+   |
-| -24h             now   |
-|[ALWAYS ON] [GRAPH][CO2]|
-+------------------------+
 ```
 
 ## Troubleshooting
@@ -160,6 +198,10 @@ Edit the `#define` values at the top of `src/main.cpp` to customize:
 - SCD-41 requires ~30 seconds warmup after power-on
 - Place sensor away from direct breath and heat sources
 - Ensure adequate ventilation around the sensor
+
+**Battery shows "USB" instead of percentage**
+- The MAX17048 battery monitor requires a LiPo battery to be connected
+- When running on USB power only, "USB" is displayed
 
 ## License
 
