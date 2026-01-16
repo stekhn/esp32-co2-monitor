@@ -7,14 +7,20 @@
  *
  * Features:
  *   - Real-time CO2, Temperature, and Humidity display
- *   - Color-coded thresholds (Green/Yellow/Orange/Red)
+ *   - Color-coded thresholds (configurable)
  *   - 24-hour history graph
- *   - Multiple display modes via buttons
- *   - Warn mode (display only when threshold exceeded)
+ *   - Multiple display modes: Bright, Dim, Power Save
+ *   - Hyperdrive mode: faster readings when CO2 changes rapidly
+ *   - Power saving: WiFi/BT disabled, light sleep, unused GPIO management
  */
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_bt.h>
+#include <esp_sleep.h>
+#include <driver/gpio.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
 #include <SensirionI2CScd4x.h>
@@ -58,10 +64,19 @@
 #define HUMID_THRESHOLD_HIGH    70.0
 
 // Timing Configuration
-#define SENSOR_READ_INTERVAL  300000      // Read sensor every 5 minutes
-#define GRAPH_SAMPLE_INTERVAL 300000      // Store graph point every 5 minutes (matches sensor interval)
-#define DISPLAY_TIMEOUT       10000       // Display timeout in warn mode (10 seconds)
-#define DEBOUNCE_DELAY        200         // Button debounce time (ms)
+#define SENSOR_READ_INTERVAL       300000 // Read sensor every 5 minutes (normal mode)
+#define SENSOR_READ_INTERVAL_FAST  60000  // Read sensor every 1 minute (hyperdrive mode)
+#define GRAPH_SAMPLE_INTERVAL      300000 // Store graph point every 5 minutes
+#define DISPLAY_TIMEOUT            10000  // Display timeout in Power Save mode (10 seconds)
+#define DEBOUNCE_DELAY             200    // Button debounce time (ms)
+
+// Hyperdrive Configuration
+#define HYPERDRIVE_THRESHOLD       100    // CO2 change (ppm) to trigger hyperdrive
+#define HYPERDRIVE_STABLE_COUNT    3      // Consecutive stable readings to exit hyperdrive
+
+// Display Brightness (PWM values 0-255)
+#define BRIGHTNESS_HIGH            255    // Full brightness
+#define BRIGHTNESS_DIM             64     // Dimmed brightness (~25%)
 
 // Graph Configuration
 #define GRAPH_POINTS          288         // Number of data points in graph (24h at 5-min intervals)
@@ -108,8 +123,9 @@ enum ViewMode {
 };
 
 enum DisplayMode {
-  MODE_ALWAYS_ON,
-  MODE_WARN,
+  MODE_BRIGHT,      // Full brightness, always on
+  MODE_DIM,         // Reduced brightness, always on
+  MODE_POWER_SAVE,  // Display off, turns on when threshold exceeded or button pressed
   DISPLAY_MODE_COUNT
 };
 
@@ -142,7 +158,7 @@ int historyCount = 0;
 // UI State
 DisplayValue currentDisplayValue = DISPLAY_CO2;
 ViewMode currentViewMode = VIEW_NUMBER;
-DisplayMode currentDisplayMode = MODE_ALWAYS_ON;
+DisplayMode currentDisplayMode = MODE_BRIGHT;
 bool displayOn = true;
 
 // Timing
@@ -152,13 +168,18 @@ unsigned long lastDisplayActivity = 0;
 unsigned long lastButtonPress[3] = {0, 0, 0};
 bool forceDisplayRefresh = true;  // Force refresh on startup and mode changes
 
+// Hyperdrive state
+bool hyperdriveActive = false;
+uint16_t lastHyperdriveCO2 = 0;    // CO2 reading used for hyperdrive comparison
+int hyperdriveStableCount = 0;     // Count of consecutive stable readings
+
 // Previous values for display update optimization
 uint16_t prevCO2 = 0;
 float prevTemperature = 0.0;
 float prevHumidity = 0.0;
 DisplayValue prevDisplayValue = DISPLAY_CO2;
 ViewMode prevViewMode = VIEW_NUMBER;
-DisplayMode prevDisplayMode = MODE_ALWAYS_ON;
+DisplayMode prevDisplayMode = MODE_BRIGHT;
 
 // Trend tracking (for arrow indicators)
 uint16_t trendCO2 = 0;
@@ -189,12 +210,16 @@ uint16_t getTemperatureColor(float temp);
 uint16_t getHumidityColor(float humidity);
 void handleButtons();
 void setDisplayPower(bool on);
+void setDisplayBrightness(int brightness);
 bool shouldDisplayBeOn();
 const char* getDisplayValueName(DisplayValue val);
 const char* getDisplayModeName(DisplayMode mode);
 void updateTrends();
 void drawTrendArrow(int x, int y, int8_t trend, uint16_t color);
 int getBatteryPercent();
+void initPowerSaving();
+void updateHyperdrive();
+void enterLightSleep(unsigned long duration_ms);
 
 // =============================================================================
 // SETUP
@@ -204,6 +229,9 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("ESP32-S3 CO2 Monitor Starting...");
+
+  // Initialize power saving (disable WiFi, Bluetooth, unused GPIOs)
+  initPowerSaving();
 
   // Initialize buttons
   // D0 is pulled HIGH internally, goes LOW when pressed
@@ -234,6 +262,7 @@ void setup() {
     delay(500);
   }
   updateHistory();  // Store first data point
+  lastHyperdriveCO2 = currentCO2;  // Initialize hyperdrive baseline
 
   Serial.println("Setup complete!");
   forceDisplayRefresh = true;
@@ -249,11 +278,32 @@ void loop() {
   // Handle button input
   handleButtons();
 
+  // Determine current sensor read interval (normal or hyperdrive)
+  unsigned long currentInterval = hyperdriveActive ? SENSOR_READ_INTERVAL_FAST : SENSOR_READ_INTERVAL;
+
   // Read sensor at regular intervals
-  if (currentMillis - lastSensorRead >= SENSOR_READ_INTERVAL) {
+  if (currentMillis - lastSensorRead >= currentInterval) {
     readSensor();
     lastSensorRead = currentMillis;
     forceDisplayRefresh = true;  // Refresh display when new data arrives
+
+    // Update hyperdrive state (only if not in Power Save mode)
+    if (currentDisplayMode != MODE_POWER_SAVE) {
+      updateHyperdrive();
+    } else if (hyperdriveActive) {
+      // Disable hyperdrive in Power Save mode
+      hyperdriveActive = false;
+      hyperdriveStableCount = 0;
+      Serial.println("Hyperdrive disabled (Power Save mode)");
+    }
+
+    // In Power Save mode, turn on display briefly if threshold exceeded
+    if (currentDisplayMode == MODE_POWER_SAVE && currentCO2 >= CO2_THRESHOLD_HIGH) {
+      lastDisplayActivity = currentMillis;
+      if (!displayOn) {
+        setDisplayPower(true);
+      }
+    }
   }
 
   // Update history for graph at regular intervals
@@ -262,12 +312,23 @@ void loop() {
     lastGraphSample = currentMillis;
   }
 
-  // Handle display power in warn mode
-  if (currentDisplayMode == MODE_WARN) {
+  // Handle display power in Power Save mode
+  if (currentDisplayMode == MODE_POWER_SAVE) {
     bool shouldBeOn = shouldDisplayBeOn();
     if (shouldBeOn != displayOn) {
       setDisplayPower(shouldBeOn);
     }
+  }
+
+  // Handle brightness changes when switching between Bright and Dim modes
+  static DisplayMode lastBrightnessMode = MODE_BRIGHT;
+  if (currentDisplayMode != lastBrightnessMode && displayOn) {
+    if (currentDisplayMode == MODE_DIM) {
+      setDisplayBrightness(BRIGHTNESS_DIM);
+    } else if (currentDisplayMode == MODE_BRIGHT) {
+      setDisplayBrightness(BRIGHTNESS_HIGH);
+    }
+    lastBrightnessMode = currentDisplayMode;
   }
 
   // Update display (smart refresh - only redraws when values change)
@@ -276,7 +337,16 @@ void loop() {
     forceDisplayRefresh = false;
   }
 
-  delay(100); // Delay to prevent CPU hogging
+  // Use light sleep if display is off and we're waiting for next sensor read
+  if (!displayOn && currentDisplayMode == MODE_POWER_SAVE) {
+    unsigned long timeUntilNextRead = currentInterval - (millis() - lastSensorRead);
+    if (timeUntilNextRead > 1000) {
+      // Sleep for a portion of the remaining time, wake periodically to check buttons
+      enterLightSleep(min(timeUntilNextRead - 500, (unsigned long)10000));
+    }
+  }
+
+  delay(100); // Small delay to prevent CPU hogging when awake
 }
 
 // =============================================================================
@@ -289,9 +359,9 @@ void initDisplay() {
   digitalWrite(TFT_I2C_POWER, HIGH);
   delay(10);
 
-  // Enable backlight
+  // Enable backlight with PWM (start at full brightness)
   pinMode(TFT_BACKLITE, OUTPUT);
-  digitalWrite(TFT_BACKLITE, HIGH);
+  analogWrite(TFT_BACKLITE, BRIGHTNESS_HIGH);
 
   // Initialize ST7789 240x135 display
   tft.init(135, 240);
@@ -328,7 +398,7 @@ void initDisplay() {
   tft.setTextColor(COLOR_LIGHT_GRAY);
   tft.setTextSize(1);
   tft.setCursor((240 - 24) / 2, 75);
-  tft.print("v0.3");
+  tft.print("v0.4");
 
   displayOn = true;
   lastDisplayActivity = millis();
@@ -887,18 +957,84 @@ void drawStatusBar() {
   tft.setCursor(20, textY);
   tft.print(metricLabel);
 
-  // Center: Power mode (light grey)
+  // Center: Mode icon + display mode + hyperdrive indicator
   const char* modeLabel;
-  if (currentDisplayMode == MODE_ALWAYS_ON) {
-    modeLabel = "ALWAYS ON";
-  } else {
-    modeLabel = "WARN";
+  switch (currentDisplayMode) {
+    case MODE_BRIGHT:     modeLabel = "BRIGHT"; break;
+    case MODE_DIM:        modeLabel = "DIM"; break;
+    case MODE_POWER_SAVE: modeLabel = "PWR SAVE"; break;
+    default:              modeLabel = ""; break;
   }
 
-  int modeWidth = strlen(modeLabel) * 6;
-  tft.setTextColor(COLOR_LIGHT_GRAY);
-  tft.setCursor(120 - modeWidth/2, textY);
-  tft.print(modeLabel);
+  // Show hyperdrive indicator if active
+  char statusStr[20];
+  if (hyperdriveActive) {
+    snprintf(statusStr, sizeof(statusStr), "%s [H]", modeLabel);
+  } else {
+    snprintf(statusStr, sizeof(statusStr), "%s", modeLabel);
+  }
+
+  // Calculate total width: icon (10px) + gap (3px) + text
+  int iconWidth = 10;
+  int gap = 3;
+  int textWidth = strlen(statusStr) * 6;
+  int totalWidth = iconWidth + gap + textWidth;
+  int startX = 120 - totalWidth / 2;
+
+  uint16_t modeColor = hyperdriveActive ? COLOR_YELLOW : COLOR_LIGHT_GRAY;
+  int iconCenterY = yPos + barHeight / 2;
+
+  // Draw mode icon (lightning bolt if hyperdrive active)
+  if (hyperdriveActive) {
+    // Lightning bolt icon
+    tft.fillTriangle(
+      startX + 5, iconCenterY - 5,   // Top point
+      startX + 1, iconCenterY,       // Middle left
+      startX + 5, iconCenterY,       // Middle center
+      modeColor
+    );
+    tft.fillTriangle(
+      startX + 4, iconCenterY,       // Middle center
+      startX + 8, iconCenterY,       // Middle right
+      startX + 4, iconCenterY + 5,   // Bottom point
+      modeColor
+    );
+  } else {
+    switch (currentDisplayMode) {
+      case MODE_BRIGHT:
+        // Sun icon: filled circle with rays
+        tft.fillCircle(startX + 4, iconCenterY, 3, modeColor);
+        // Small rays
+        tft.drawPixel(startX + 4, iconCenterY - 5, modeColor);
+        tft.drawPixel(startX + 4, iconCenterY + 5, modeColor);
+        tft.drawPixel(startX - 1, iconCenterY, modeColor);
+        tft.drawPixel(startX + 9, iconCenterY, modeColor);
+        break;
+      case MODE_DIM:
+        // Moon icon: crescent shape
+        tft.fillCircle(startX + 4, iconCenterY, 4, modeColor);
+        tft.fillCircle(startX + 6, iconCenterY - 1, 3, COLOR_BLACK);  // Cut out crescent
+        break;
+      case MODE_POWER_SAVE:
+        // Leaf icon - teardrop shape with stem
+        tft.fillCircle(startX + 5, iconCenterY - 1, 3, modeColor);  // Round part
+        tft.fillTriangle(
+          startX + 2, iconCenterY - 1,   // Left of circle
+          startX + 8, iconCenterY - 1,   // Right of circle
+          startX + 5, iconCenterY + 4,   // Bottom tip
+          modeColor
+        );
+        tft.drawLine(startX + 5, iconCenterY + 4, startX + 3, iconCenterY + 6, modeColor);  // Stem
+        break;
+      default:
+        break;
+    }
+  }
+
+  // Draw mode text
+  tft.setTextColor(modeColor);
+  tft.setCursor(startX + iconWidth + gap, textY);
+  tft.print(statusStr);
 
   // Right: Battery icon + percentage
   int batteryPercent = getBatteryPercent();
@@ -1005,8 +1141,8 @@ void handleButtons() {
 
       Serial.printf("Display value: %s\n", getDisplayValueName(currentDisplayValue));
 
-      // Wake display if in warn mode
-      if (currentDisplayMode == MODE_WARN && !displayOn) {
+      // Wake display if in Power Save mode
+      if (currentDisplayMode == MODE_POWER_SAVE && !displayOn) {
         setDisplayPower(true);
       }
     }
@@ -1023,14 +1159,14 @@ void handleButtons() {
 
       Serial.printf("View mode: %s\n", currentViewMode == VIEW_NUMBER ? "Number" : "Graph");
 
-      // Wake display if in warn mode
-      if (currentDisplayMode == MODE_WARN && !displayOn) {
+      // Wake display if in Power Save mode
+      if (currentDisplayMode == MODE_POWER_SAVE && !displayOn) {
         setDisplayPower(true);
       }
     }
   }
 
-  // Button D2 - Toggle between always-on and warn mode
+  // Button D2 - Cycle through display modes (Bright -> Dim -> Power Save)
   // D2 is pulled LOW, goes HIGH when pressed
   if (digitalRead(BUTTON_D2) == HIGH) {
     if (currentMillis - lastButtonPress[2] >= DEBOUNCE_DELAY) {
@@ -1057,27 +1193,34 @@ void setDisplayPower(bool on) {
   if (on == displayOn) return;
 
   displayOn = on;
-  digitalWrite(TFT_BACKLITE, on ? HIGH : LOW);
 
   if (on) {
+    // Set brightness based on display mode
+    int brightness = (currentDisplayMode == MODE_DIM) ? BRIGHTNESS_DIM : BRIGHTNESS_HIGH;
+    analogWrite(TFT_BACKLITE, brightness);
     lastDisplayActivity = millis();
     // Force full redraw
     prevViewMode = (ViewMode)255;
+  } else {
+    analogWrite(TFT_BACKLITE, 0);
   }
 
   Serial.printf("Display: %s\n", on ? "ON" : "OFF");
 }
 
+void setDisplayBrightness(int brightness) {
+  if (displayOn) {
+    analogWrite(TFT_BACKLITE, brightness);
+  }
+}
+
 bool shouldDisplayBeOn() {
   unsigned long currentMillis = millis();
 
-  // Check if threshold is exceeded (CO2 only for warn mode)
-  bool thresholdExceeded = currentCO2 >= CO2_THRESHOLD_MODERATE;
-
-  // Check if recent button activity
+  // Check if recent activity (button press or threshold trigger)
   bool recentActivity = (currentMillis - lastDisplayActivity) < DISPLAY_TIMEOUT;
 
-  return thresholdExceeded || recentActivity;
+  return recentActivity;
 }
 
 // =============================================================================
@@ -1095,8 +1238,110 @@ const char* getDisplayValueName(DisplayValue val) {
 
 const char* getDisplayModeName(DisplayMode mode) {
   switch (mode) {
-    case MODE_ALWAYS_ON: return "ALWAYS ON";
-    case MODE_WARN: return "WARN MODE";
+    case MODE_BRIGHT: return "BRIGHT";
+    case MODE_DIM: return "DIM";
+    case MODE_POWER_SAVE: return "POWER SAVE";
     default: return "Unknown";
+  }
+}
+
+// =============================================================================
+// POWER MANAGEMENT FUNCTIONS
+// =============================================================================
+
+void initPowerSaving() {
+  Serial.println("Initializing power saving...");
+
+  // Disable WiFi
+  WiFi.mode(WIFI_OFF);
+  esp_wifi_stop();
+  esp_wifi_deinit();
+  Serial.println("  WiFi disabled");
+
+  // Disable Bluetooth
+  esp_bt_controller_disable();
+  Serial.println("  Bluetooth disabled");
+
+  // Configure unused GPIO pins to save power
+  // ESP32-S3 Reverse TFT Feather pins in use:
+  // - GPIO 0, 1, 2: Buttons
+  // - GPIO 8, 9: I2C (SDA, SCL) for sensor and battery monitor
+  // - GPIO 5, 6, 7, 35, 36: TFT display (CS, DC, RST, BACKLITE, I2C_POWER)
+  // - GPIO 21: NEOPIXEL (onboard)
+  //
+  // Unused pins should be set to INPUT with no pull resistors
+  // to minimize current leakage
+  const int unusedPins[] = {3, 4, 10, 11, 12, 13, 14, 15, 16, 17, 18, 37, 38, 39, 40, 41, 42};
+  for (int i = 0; i < sizeof(unusedPins) / sizeof(unusedPins[0]); i++) {
+    gpio_reset_pin((gpio_num_t)unusedPins[i]);
+    gpio_set_direction((gpio_num_t)unusedPins[i], GPIO_MODE_INPUT);
+    gpio_set_pull_mode((gpio_num_t)unusedPins[i], GPIO_FLOATING);
+  }
+  Serial.println("  Unused GPIOs configured");
+
+  // Disable onboard NeoPixel to save power
+  pinMode(PIN_NEOPIXEL, OUTPUT);
+  digitalWrite(PIN_NEOPIXEL, LOW);
+  Serial.println("  NeoPixel disabled");
+
+  Serial.println("Power saving initialized");
+}
+
+void updateHyperdrive() {
+  // Calculate CO2 change since last hyperdrive check
+  int co2Change = abs((int)currentCO2 - (int)lastHyperdriveCO2);
+
+  if (!hyperdriveActive) {
+    // Check if we should enter hyperdrive
+    if (co2Change >= HYPERDRIVE_THRESHOLD) {
+      hyperdriveActive = true;
+      hyperdriveStableCount = 0;
+      Serial.printf("Hyperdrive ACTIVATED (CO2 change: %d ppm)\n", co2Change);
+    }
+  } else {
+    // Check if we should exit hyperdrive
+    if (co2Change < HYPERDRIVE_THRESHOLD) {
+      hyperdriveStableCount++;
+      Serial.printf("Hyperdrive stable reading %d/%d\n", hyperdriveStableCount, HYPERDRIVE_STABLE_COUNT);
+
+      if (hyperdriveStableCount >= HYPERDRIVE_STABLE_COUNT) {
+        hyperdriveActive = false;
+        hyperdriveStableCount = 0;
+        Serial.println("Hyperdrive DEACTIVATED (values stabilized)");
+      }
+    } else {
+      // Still changing rapidly, reset stable count
+      hyperdriveStableCount = 0;
+    }
+  }
+
+  // Update baseline for next comparison
+  lastHyperdriveCO2 = currentCO2;
+}
+
+void enterLightSleep(unsigned long duration_ms) {
+  if (duration_ms < 100) return;  // Don't sleep for very short periods
+
+  Serial.printf("Entering light sleep for %lu ms\n", duration_ms);
+  Serial.flush();  // Ensure message is printed before sleep
+
+  // Configure wake sources
+  // Wake on button press (GPIO 0 goes LOW when pressed)
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);  // Wake when GPIO 0 is LOW
+
+  // Wake on timer
+  esp_sleep_enable_timer_wakeup(duration_ms * 1000);  // Convert to microseconds
+
+  // Enter light sleep
+  esp_light_sleep_start();
+
+  // After waking up
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+
+  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) {
+    Serial.println("Woke up from button press");
+    lastDisplayActivity = millis();  // Mark activity for display timeout
+  } else if (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) {
+    Serial.println("Woke up from timer");
   }
 }

@@ -2,7 +2,7 @@
 
 A firmware for monitoring indoor air quality using the Adafruit ESP32-S3 Reverse TFT Feather and SCD-41 CO2 sensor.
 
-**Version:** 0.1
+**Version:** 0.4
 
 ## Hardware Required
 
@@ -18,72 +18,94 @@ Connect the SCD-41 to the ESP32-S3 Reverse TFT Feather using the STEMMA QT conne
 ## Features
 
 - **Real-time monitoring** of CO2, Temperature, and Humidity
-- **Color-coded CO2 thresholds** for quick visual assessment
-- **Trend indicators** showing if values are rising or falling
+- **Color-coded thresholds** for quick visual assessment (configurable)
+- **Trend indicators** showing if values are rising, falling, or stable
 - **24-hour history graph** with threshold lines
 - **Battery monitoring** with MAX17048 fuel gauge
 - **Smart display refresh** - only updates when values change (no flicker)
-- **Power saving warn mode** - display activates only when thresholds exceeded
+- **Three display modes**: Bright, Dim, and Power Save
+- **Hyperdrive mode** - automatic faster readings when CO2 changes rapidly
+- **Power saving** - WiFi/Bluetooth disabled, light sleep, optimized GPIO configuration
+
+## Display Modes
+
+| Mode       | Brightness | Behavior |
+|------------|------------|----------|
+| Bright     | 100%       | Always on |
+| Dim        | ~25%       | Always on, reduced brightness |
+| Power Save | Off        | Display activates for 10s when CO2 exceeds threshold or button pressed |
+
+## Hyperdrive Mode
+
+When CO2 levels change rapidly (e.g., opening a window), hyperdrive mode automatically activates:
+
+- **Trigger**: CO2 changes by ≥100 ppm between readings
+- **Effect**: Sensor read interval changes from 5 minutes to 1 minute
+- **Exit**: After 3 consecutive stable readings (<100 ppm change)
+- **Indicator**: Status bar shows `[H]` when active
+- **Note**: Disabled in Power Save mode to conserve battery
 
 ## Display Colors
 
-All metrics use color-coded thresholds with diverging scales for temperature and humidity (white = optimal).
+All metrics use color-coded thresholds. Temperature and humidity use diverging scales where white indicates optimal values.
 
 | Metric      | Color Scale |
 |-------------|-------------|
-| CO2         | Green → Yellow → Orange → Red (sequential) |
-| Temperature | Blue → Cyan → **White** → Yellow → Orange (diverging) |
-| Humidity    | Orange → Yellow → **White** → Cyan → Blue (diverging) |
+| CO2         | Green → Yellow → Orange → Red (sequential, lower is better) |
+| Temperature | Blue → Cyan → **White** → Yellow → Orange (diverging, middle is optimal) |
+| Humidity    | Orange → Yellow → **White** → Cyan → Blue (diverging, middle is optimal) |
 
 ## CO2 Thresholds
 
-| Level  | CO2 (ppm) | Meaning                          |
-|--------|-----------|----------------------------------|
-| Green  | < 800     | Excellent air quality            |
-| Yellow | 800-1000  | Acceptable, consider ventilating |
-| Orange | 1000-1500 | Poor, should ventilate           |
-| Red    | > 1500    | Unhealthy, ventilate immediately |
+| Level    | CO2 (ppm) | Color  | Meaning                          |
+|----------|-----------|--------|----------------------------------|
+| Low      | < 800     | Green  | Excellent air quality            |
+| Moderate | 800-1000  | Yellow | Acceptable, consider ventilating |
+| High     | 1000-1200 | Orange | Poor, should ventilate           |
+| Critical | > 1200    | Red    | Unhealthy, ventilate immediately |
 
 ## Temperature Thresholds
 
-| Color  | Temperature (°C) | Meaning        |
-|--------|------------------|----------------|
-| Blue   | < 18             | Too cold       |
-| Cyan   | 18-20            | Cool           |
-| White  | 20-25            | Optimal        |
-| Yellow | 25-28            | Warm           |
-| Orange | > 28             | Too hot        |
+| Level   | Temperature (°C) | Color  | Meaning  |
+|---------|------------------|--------|----------|
+| Cold    | < 16             | Blue   | Too cold |
+| Cool    | 16-20            | Cyan   | Cool     |
+| Optimal | 20-24            | White  | Optimal  |
+| Warm    | 24-28            | Yellow | Warm     |
+| Hot     | > 28             | Orange | Too hot  |
 
 ## Humidity Thresholds
 
-| Color  | Humidity (%) | Meaning        |
-|--------|--------------|----------------|
-| Orange | < 30         | Too dry        |
-| Yellow | 30-40        | Low            |
-| White  | 40-60        | Optimal        |
-| Cyan   | 60-70        | High           |
-| Blue   | > 70         | Too wet        |
+| Level   | Humidity (%) | Color  | Meaning  |
+|---------|--------------|--------|----------|
+| Dry     | < 30         | Orange | Too dry  |
+| Low     | 30-40        | Yellow | Low      |
+| Optimal | 40-60        | White  | Optimal  |
+| High    | 60-70        | Cyan   | High     |
+| Wet     | > 70         | Blue   | Too wet  |
 
 ## Button Functions
 
-| Button    | Function                                       |
-|-----------|------------------------------------------------|
-| D0 (Boot) | Cycle displayed value: CO2 -> Temp -> Humidity |
-| D1        | Toggle view: Number <-> Graph                  |
-| D2        | Toggle mode: Always On <-> Warn Mode           |
+| Button    | Function                                            |
+|-----------|-----------------------------------------------------|
+| D0 (Boot) | Cycle displayed value: CO2 → Temp → Humidity        |
+| D1        | Toggle view: Number ↔ Graph                         |
+| D2        | Cycle display mode: Bright → Dim → Power Save       |
 
-### Warn Mode
+### Power Save Mode
 
-In warn mode, the display turns off when CO2 levels are acceptable (<800 ppm). It automatically turns on when:
-- CO2 exceeds the yellow threshold (800 ppm)
-- Any button is pressed (temporary wake for 10 seconds)
+In Power Save mode, the display is off by default to conserve battery. It automatically turns on for 10 seconds when:
+- CO2 exceeds the "High" threshold (1200 ppm) after a sensor reading
+- Any button is pressed
+
+The device enters light sleep between sensor readings, waking on button press or timer.
 
 ## Display Layout
 
 ### Number View
 ```
 +-----------------------------------------+
-| [*] CO2    ALWAYS ON        [===] 85%   |  <- Status bar (top)
+| [*] CO2      BRIGHT          [===] 85%  |  <- Status bar
 |                                         |
 |   1234 ppm                        ^     |  <- Big value + unit + trend
 |                                         |
@@ -95,7 +117,7 @@ In warn mode, the display turns off when CO2 levels are acceptable (<800 ppm). I
 ### Graph View
 ```
 +-----------------------------------------+
-| [*] CO2    ALWAYS ON        [===] 85%   |  <- Status bar (top)
+| [*] CO2      DIM [H]         [===] 85%  |  <- Status bar ([H] = hyperdrive)
 |                                         |
 |   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~    2500  |  <- Graph with threshold
 |   ----------------------------          |     lines and scale
@@ -158,30 +180,70 @@ In warn mode, the display turns off when CO2 levels are acceptable (<800 ppm). I
 
 Edit the `#define` values at the top of `src/main.cpp` to customize:
 
+### Thresholds and Colors
+
 ```cpp
-// CO2 Thresholds (in ppm)
-#define CO2_THRESHOLD_GREEN   800
-#define CO2_THRESHOLD_YELLOW  1000
-#define CO2_THRESHOLD_ORANGE  1500
-#define CO2_THRESHOLD_RED     2000
+// CO2 Thresholds (in ppm) - Sequential scale
+#define CO2_COLOR_LOW         COLOR_GREEN   // Excellent
+#define CO2_COLOR_MODERATE    COLOR_YELLOW  // Acceptable
+#define CO2_COLOR_HIGH        COLOR_ORANGE  // Poor
+#define CO2_COLOR_CRITICAL    COLOR_RED     // Unhealthy
+#define CO2_THRESHOLD_LOW     800
+#define CO2_THRESHOLD_MODERATE 1000
+#define CO2_THRESHOLD_HIGH    1200
+#define CO2_THRESHOLD_CRITICAL 1400
 
-// Temperature thresholds (in Celsius) - diverging scale, white center
-#define TEMP_THRESHOLD_COLD   18.0
-#define TEMP_THRESHOLD_COOL   20.0   // Lower bound of optimal (white)
-#define TEMP_THRESHOLD_WARM   25.0   // Upper bound of optimal (white)
-#define TEMP_THRESHOLD_HOT    28.0
+// Temperature thresholds (in Celsius) - Diverging scale
+#define TEMP_COLOR_COLD       COLOR_BLUE
+#define TEMP_COLOR_COOL       COLOR_CYAN
+#define TEMP_COLOR_OPTIMAL    COLOR_WHITE
+#define TEMP_COLOR_WARM       COLOR_YELLOW
+#define TEMP_COLOR_HOT        COLOR_ORANGE
+#define TEMP_THRESHOLD_COLD   16.0
+#define TEMP_THRESHOLD_COOL   20.0
+#define TEMP_THRESHOLD_OPTIMAL 24.0
+#define TEMP_THRESHOLD_WARM   28.0
 
-// Humidity thresholds (in %) - diverging scale, white center
+// Humidity thresholds (in %) - Diverging scale
+#define HUMID_COLOR_DRY       COLOR_ORANGE
+#define HUMID_COLOR_LOW       COLOR_YELLOW
+#define HUMID_COLOR_OPTIMAL   COLOR_WHITE
+#define HUMID_COLOR_HIGH      COLOR_CYAN
+#define HUMID_COLOR_WET       COLOR_BLUE
 #define HUMID_THRESHOLD_DRY   30.0
-#define HUMID_THRESHOLD_LOW   40.0   // Lower bound of optimal (white)
-#define HUMID_THRESHOLD_HIGH  60.0   // Upper bound of optimal (white)
-#define HUMID_THRESHOLD_WET   70.0
-
-// Timing
-#define SENSOR_READ_INTERVAL  300000    // Read sensor every 5 minutes
-#define GRAPH_SAMPLE_INTERVAL 720000    // Graph point every 12 minutes
-#define DISPLAY_TIMEOUT       10000     // Warn mode display timeout
+#define HUMID_THRESHOLD_LOW   40.0
+#define HUMID_THRESHOLD_OPTIMAL 60.0
+#define HUMID_THRESHOLD_HIGH  70.0
 ```
+
+### Timing and Behavior
+
+```cpp
+// Timing Configuration
+#define SENSOR_READ_INTERVAL       300000  // Normal: 5 minutes
+#define SENSOR_READ_INTERVAL_FAST  60000   // Hyperdrive: 1 minute
+#define GRAPH_SAMPLE_INTERVAL      300000  // Graph point every 5 minutes
+#define DISPLAY_TIMEOUT            10000   // Power Save display timeout (10s)
+
+// Hyperdrive Configuration
+#define HYPERDRIVE_THRESHOLD       100     // CO2 change (ppm) to trigger
+#define HYPERDRIVE_STABLE_COUNT    3       // Stable readings to exit
+
+// Display Brightness (PWM values 0-255)
+#define BRIGHTNESS_HIGH            255     // Full brightness
+#define BRIGHTNESS_DIM             64      // Dimmed (~25%)
+```
+
+## Power Saving Features
+
+The firmware implements several power-saving measures:
+
+- **WiFi disabled** - Not used, saves significant power
+- **Bluetooth disabled** - Not used, saves power
+- **Unused GPIO pins** - Configured as floating inputs to minimize leakage
+- **NeoPixel disabled** - Onboard LED turned off
+- **Light sleep** - In Power Save mode, CPU enters light sleep between sensor reads
+- **PWM backlight** - Allows dimming instead of just on/off
 
 ## Troubleshooting
 
@@ -202,6 +264,14 @@ Edit the `#define` values at the top of `src/main.cpp` to customize:
 **Battery shows "USB" instead of percentage**
 - The MAX17048 battery monitor requires a LiPo battery to be connected
 - When running on USB power only, "USB" is displayed
+
+**Hyperdrive not activating**
+- Hyperdrive is disabled in Power Save mode
+- Ensure CO2 change is ≥100 ppm between readings
+
+**Light sleep not working**
+- Light sleep only activates in Power Save mode when display is off
+- Serial monitor may interfere with sleep; disconnect for true power measurement
 
 ## License
 
