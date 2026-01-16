@@ -78,6 +78,15 @@
 #define BRIGHTNESS_HIGH            255    // Full brightness
 #define BRIGHTNESS_DIM             64     // Dimmed brightness (~25%)
 
+// EMA Filter Configuration (alpha: 0=max smoothing, 1=no smoothing)
+#define EMA_ALPHA_CO2              0.3    // CO2 changes slowly, moderate smoothing
+#define EMA_ALPHA_TEMPERATURE      0.2    // Temperature is stable, more smoothing
+#define EMA_ALPHA_HUMIDITY         0.2    // Humidity is stable, more smoothing
+
+// SCD41 Sensor Configuration
+#define SCD41_TEMPERATURE_OFFSET   2      // Temperature offset in °C (sensor self-heating compensation)
+#define SCD41_ALTITUDE             525    // Altitude in meters (0 = sea level, set for your location)
+
 // Graph Configuration
 #define GRAPH_POINTS          288         // Number of data points in graph (24h at 5-min intervals)
 #define GRAPH_HEIGHT          80          // Height of graph area in pixels
@@ -143,10 +152,16 @@ bool batteryMonitorAvailable = false;
 // GLOBAL STATE
 // =============================================================================
 
-// Current readings
+// Current readings (raw from sensor)
+uint16_t rawCO2 = 0;
+float rawTemperature = 0.0;
+float rawHumidity = 0.0;
+
+// Filtered readings (EMA smoothed) - these are used for display
 uint16_t currentCO2 = 0;
 float currentTemperature = 0.0;
 float currentHumidity = 0.0;
+bool emaInitialized = false;  // First reading initializes EMA, subsequent readings are filtered
 
 // Graph history (circular buffer)
 uint16_t historyC02[GRAPH_POINTS] = {0};
@@ -169,7 +184,7 @@ unsigned long lastButtonPress[3] = {0, 0, 0};
 bool forceDisplayRefresh = true;  // Force refresh on startup and mode changes
 
 // Hyperdrive state
-bool hyperdriveActive = false;
+bool hyperdriveActive = true;      // Start in hyperdrive for quick initial readings
 uint16_t lastHyperdriveCO2 = 0;    // CO2 reading used for hyperdrive comparison
 int hyperdriveStableCount = 0;     // Count of consecutive stable readings
 
@@ -398,7 +413,7 @@ void initDisplay() {
   tft.setTextColor(COLOR_LIGHT_GRAY);
   tft.setTextSize(1);
   tft.setCursor((240 - 24) / 2, 75);
-  tft.print("v0.4");
+  tft.print("v0.5");
 
   displayOn = true;
   lastDisplayActivity = millis();
@@ -410,7 +425,7 @@ void initSensor() {
   // SCD41 default I2C address is 0x62
   scd4x.begin(Wire);
 
-  // Stop any previous measurements
+  // Stop any previous measurements (required before configuration)
   uint16_t error = scd4x.stopPeriodicMeasurement();
   if (error) {
     Serial.println("Error stopping measurement");
@@ -435,6 +450,38 @@ void initSensor() {
 
   Serial.printf("SCD-41 Serial: %04X%04X%04X\n", serial0, serial1, serial2);
 
+  // === SCD41 Best Practices Configuration ===
+
+  // Set temperature offset to compensate for sensor self-heating
+  // The SCD41 generates heat which affects temperature readings
+  error = scd4x.setTemperatureOffset(SCD41_TEMPERATURE_OFFSET);
+  if (error) {
+    Serial.println("Error setting temperature offset");
+  } else {
+    Serial.printf("Temperature offset set to %.1f C\n", SCD41_TEMPERATURE_OFFSET);
+  }
+
+  // Set sensor altitude for CO2 pressure compensation
+  // This improves CO2 accuracy based on local atmospheric pressure
+  if (SCD41_ALTITUDE > 0) {
+    error = scd4x.setSensorAltitude(SCD41_ALTITUDE);
+    if (error) {
+      Serial.println("Error setting sensor altitude");
+    } else {
+      Serial.printf("Sensor altitude set to %d m\n", SCD41_ALTITUDE);
+    }
+  }
+
+  // Enable automatic self-calibration (ASC)
+  // ASC assumes exposure to ~400ppm fresh air at least once per week
+  // This is enabled by default, but we explicitly enable it to be sure
+  error = scd4x.setAutomaticSelfCalibration(1);
+  if (error) {
+    Serial.println("Error enabling automatic self-calibration");
+  } else {
+    Serial.println("Automatic self-calibration enabled");
+  }
+
   // Start periodic measurements
   error = scd4x.startPeriodicMeasurement();
   if (error) {
@@ -443,8 +490,14 @@ void initSensor() {
 
   Serial.println("SCD-41 sensor initialized");
 
-  // Wait for first measurement (SCD41 measures every 5 seconds)
+  // Wait for first measurement and discard it (recommended by Sensirion)
+  // The first reading after power-on may be less accurate
+  Serial.println("Discarding first sensor reading...");
   delay(5000);
+  uint16_t co2;
+  float temp, hum;
+  scd4x.readMeasurement(co2, temp, hum);  // Discard first reading
+
   tft.fillScreen(COLOR_BLACK);
 }
 
@@ -474,14 +527,33 @@ void readSensor() {
 
     // Only update if we got valid data (CO2 = 0 means invalid)
     if (co2 > 0) {
-      currentCO2 = co2;
-      currentTemperature = temp;
-      currentHumidity = humidity;
+      // Store raw readings
+      rawCO2 = co2;
+      rawTemperature = temp;
+      rawHumidity = humidity;
 
-      // Update trends
+      // Apply EMA filter
+      if (!emaInitialized) {
+        // First valid reading: initialize filtered values directly
+        currentCO2 = co2;
+        currentTemperature = temp;
+        currentHumidity = humidity;
+        emaInitialized = true;
+        Serial.println("EMA filter initialized with first reading");
+      } else {
+        // Apply exponential moving average filter
+        // Formula: filtered = alpha * new + (1 - alpha) * filtered
+        currentCO2 = (uint16_t)(EMA_ALPHA_CO2 * co2 + (1.0 - EMA_ALPHA_CO2) * currentCO2);
+        currentTemperature = EMA_ALPHA_TEMPERATURE * temp + (1.0 - EMA_ALPHA_TEMPERATURE) * currentTemperature;
+        currentHumidity = EMA_ALPHA_HUMIDITY * humidity + (1.0 - EMA_ALPHA_HUMIDITY) * currentHumidity;
+      }
+
+      // Update trends (based on filtered values)
       updateTrends();
 
-      Serial.printf("CO2: %d ppm, Temp: %.1f C, Humidity: %.1f %%\n",
+      Serial.printf("Raw:      CO2=%d ppm, Temp=%.1f C, Humidity=%.1f %%\n",
+                    rawCO2, rawTemperature, rawHumidity);
+      Serial.printf("Filtered: CO2=%d ppm, Temp=%.1f C, Humidity=%.1f %%\n",
                     currentCO2, currentTemperature, currentHumidity);
     }
   }
@@ -966,22 +1038,14 @@ void drawStatusBar() {
     default:              modeLabel = ""; break;
   }
 
-  // Show hyperdrive indicator if active
-  char statusStr[20];
-  if (hyperdriveActive) {
-    snprintf(statusStr, sizeof(statusStr), "%s [H]", modeLabel);
-  } else {
-    snprintf(statusStr, sizeof(statusStr), "%s", modeLabel);
-  }
-
   // Calculate total width: icon (10px) + gap (3px) + text
   int iconWidth = 10;
   int gap = 3;
-  int textWidth = strlen(statusStr) * 6;
+  int textWidth = strlen(modeLabel) * 6;
   int totalWidth = iconWidth + gap + textWidth;
   int startX = 120 - totalWidth / 2;
 
-  uint16_t modeColor = hyperdriveActive ? COLOR_YELLOW : COLOR_LIGHT_GRAY;
+  uint16_t modeColor = COLOR_LIGHT_GRAY;
   int iconCenterY = yPos + barHeight / 2;
 
   // Draw mode icon (lightning bolt if hyperdrive active)
@@ -1034,28 +1098,20 @@ void drawStatusBar() {
   // Draw mode text
   tft.setTextColor(modeColor);
   tft.setCursor(startX + iconWidth + gap, textY);
-  tft.print(statusStr);
+  tft.print(modeLabel);
 
   // Right: Battery icon + percentage
   int batteryPercent = getBatteryPercent();
   char batteryStr[8];
-  uint16_t batteryColor;
 
   if (batteryPercent >= 0) {
     snprintf(batteryStr, sizeof(batteryStr), "%d%%", batteryPercent);
-    // Color based on battery level
-    if (batteryPercent > 50) {
-      batteryColor = COLOR_GREEN;
-    } else if (batteryPercent > 20) {
-      batteryColor = COLOR_YELLOW;
-    } else {
-      batteryColor = COLOR_RED;
-    }
   } else {
     // No battery / USB powered
     snprintf(batteryStr, sizeof(batteryStr), "USB");
-    batteryColor = COLOR_LIGHT_GRAY;
   }
+
+  uint16_t batteryColor = COLOR_LIGHT_GRAY;
 
   // Draw battery icon (small rectangle with nub)
   int batteryIconX = 190;
@@ -1083,17 +1139,13 @@ void drawStatusBar() {
 }
 
 int getBatteryPercent() {
-  // Use MAX17048 battery fuel gauge if available
   if (batteryMonitorAvailable) {
     float percent = batteryMonitor.cellPercent();
-    // Clamp to 0-100
     if (percent > 100) percent = 100;
     if (percent < 0) percent = 0;
     return (int)percent;
   }
-
-  // No battery monitor available - return -1 to indicate USB power
-  return -1;
+  return -1;  // No battery monitor available
 }
 
 // =============================================================================

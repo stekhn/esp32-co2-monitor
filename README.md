@@ -22,17 +22,17 @@ Connect the SCD-41 to the ESP32-S3 Reverse TFT Feather using the STEMMA QT conne
 - **Trend indicators** showing if values are rising, falling, or stable
 - **24-hour history graph** with threshold lines
 - **Battery monitoring** with MAX17048 fuel gauge
-- **Smart display refresh** - only updates when values change (no flicker)
+- **Smart display refresh**: only updates when values change
 - **Three display modes**: Bright, Dim, and Power Save
-- **Hyperdrive mode** - automatic faster readings when CO2 changes rapidly
-- **Power saving** - WiFi/Bluetooth disabled, light sleep, optimized GPIO configuration
+- **Hyperdrive mode**:  automatic faster readings when CO2 changes rapidly
+- **Power saving**: WiFi/Bluetooth disabled, light sleep, optimized GPIO configuration
 
 ## Display Modes
 
-| Mode       | Brightness | Behavior |
-|------------|------------|----------|
-| Bright     | 100%       | Always on |
-| Dim        | ~25%       | Always on, reduced brightness |
+| Mode       | Brightness | Behavior                                                               |
+| ---------- | ---------- | ---------------------------------------------------------------------- |
+| Bright     | 100%       | Always on                                                              |
+| Dim        | ~25%       | Always on, reduced brightness                                          |
 | Power Save | Off        | Display activates for 10s when CO2 exceeds threshold or button pressed |
 
 ## Hyperdrive Mode
@@ -49,16 +49,16 @@ When CO2 levels change rapidly (e.g., opening a window), hyperdrive mode automat
 
 All metrics use color-coded thresholds. Temperature and humidity use diverging scales where white indicates optimal values.
 
-| Metric      | Color Scale |
-|-------------|-------------|
-| CO2         | Green → Yellow → Orange → Red (sequential, lower is better) |
+| Metric      | Color Scale                                                              |
+| ----------- | ------------------------------------------------------------------------ |
+| CO2         | Green → Yellow → Orange → Red (sequential, lower is better)              |
 | Temperature | Blue → Cyan → **White** → Yellow → Orange (diverging, middle is optimal) |
 | Humidity    | Orange → Yellow → **White** → Cyan → Blue (diverging, middle is optimal) |
 
 ## CO2 Thresholds
 
 | Level    | CO2 (ppm) | Color  | Meaning                          |
-|----------|-----------|--------|----------------------------------|
+| -------- | --------- | ------ | -------------------------------- |
 | Low      | < 800     | Green  | Excellent air quality            |
 | Moderate | 800-1000  | Yellow | Acceptable, consider ventilating |
 | High     | 1000-1200 | Orange | Poor, should ventilate           |
@@ -67,7 +67,7 @@ All metrics use color-coded thresholds. Temperature and humidity use diverging s
 ## Temperature Thresholds
 
 | Level   | Temperature (°C) | Color  | Meaning  |
-|---------|------------------|--------|----------|
+| ------- | ---------------- | ------ | -------- |
 | Cold    | < 16             | Blue   | Too cold |
 | Cool    | 16-20            | Cyan   | Cool     |
 | Optimal | 20-24            | White  | Optimal  |
@@ -76,25 +76,26 @@ All metrics use color-coded thresholds. Temperature and humidity use diverging s
 
 ## Humidity Thresholds
 
-| Level   | Humidity (%) | Color  | Meaning  |
-|---------|--------------|--------|----------|
-| Dry     | < 30         | Orange | Too dry  |
-| Low     | 30-40        | Yellow | Low      |
-| Optimal | 40-60        | White  | Optimal  |
-| High    | 60-70        | Cyan   | High     |
-| Wet     | > 70         | Blue   | Too wet  |
+| Level   | Humidity (%) | Color  | Meaning |
+| ------- | ------------ | ------ | ------- |
+| Dry     | < 30         | Orange | Too dry |
+| Low     | 30-40        | Yellow | Low     |
+| Optimal | 40-60        | White  | Optimal |
+| High    | 60-70        | Cyan   | High    |
+| Wet     | > 70         | Blue   | Too wet |
 
 ## Button Functions
 
-| Button    | Function                                            |
-|-----------|-----------------------------------------------------|
-| D0 (Boot) | Cycle displayed value: CO2 → Temp → Humidity        |
-| D1        | Toggle view: Number ↔ Graph                         |
-| D2        | Cycle display mode: Bright → Dim → Power Save       |
+| Button    | Function                                      |
+| --------- | --------------------------------------------- |
+| D0 (Boot) | Cycle displayed value: CO2 → Temp → Humidity  |
+| D1        | Toggle view: Number ↔ Graph                   |
+| D2        | Cycle display mode: Bright → Dim → Power Save |
 
 ### Power Save Mode
 
 In Power Save mode, the display is off by default to conserve battery. It automatically turns on for 10 seconds when:
+
 - CO2 exceeds the "High" threshold (1200 ppm) after a sensor reading
 - Any button is pressed
 
@@ -103,6 +104,7 @@ The device enters light sleep between sensor readings, waking on button press or
 ## Display Layout
 
 ### Number View
+
 ```
 +-----------------------------------------+
 | [*] CO2      BRIGHT          [===] 85%  |  <- Status bar
@@ -115,6 +117,7 @@ The device enters light sleep between sensor readings, waking on button press or
 ```
 
 ### Graph View
+
 ```
 +-----------------------------------------+
 | [*] CO2      DIM [H]         [===] 85%  |  <- Status bar ([H] = hyperdrive)
@@ -135,12 +138,14 @@ The device enters light sleep between sensor readings, waking on button press or
 2. Clone or download this repository
 
 3. Open the project folder in VS Code with PlatformIO extension, or use the CLI:
+
    ```bash
    cd esp32-co2-monitor
    pio run
    ```
 
 4. Connect the ESP32-S3 via USB and flash:
+
    ```bash
    pio run --target upload
    ```
@@ -155,6 +160,7 @@ The device enters light sleep between sensor readings, waking on button press or
 1. Install the [Arduino IDE](https://www.arduino.cc/en/software)
 
 2. Add ESP32 board support:
+
    - Go to File -> Preferences
    - Add to "Additional Board Manager URLs":
      ```
@@ -164,6 +170,7 @@ The device enters light sleep between sensor readings, waking on button press or
    - Search for "esp32" and install "esp32 by Espressif Systems"
 
 3. Install required libraries via Library Manager:
+
    - Adafruit GFX Library
    - Adafruit ST7735 and ST7789 Library
    - Sensirion I2C SCD4x
@@ -248,28 +255,34 @@ The firmware implements several power-saving measures:
 ## Troubleshooting
 
 **"Sensor Error!" on startup**
+
 - Check STEMMA QT cable connection
 - Ensure SCD-41 is properly powered
 - Try a different I2C cable
 
 **Display not working**
+
 - Ensure you're using the latest ESP32 board support package
 - The TFT_I2C_POWER pin must be set HIGH (done automatically in code)
 
 **Readings seem incorrect**
+
 - SCD-41 requires ~30 seconds warmup after power-on
 - Place sensor away from direct breath and heat sources
 - Ensure adequate ventilation around the sensor
 
 **Battery shows "USB" instead of percentage**
+
 - The MAX17048 battery monitor requires a LiPo battery to be connected
 - When running on USB power only, "USB" is displayed
 
 **Hyperdrive not activating**
+
 - Hyperdrive is disabled in Power Save mode
 - Ensure CO2 change is ≥100 ppm between readings
 
 **Light sleep not working**
+
 - Light sleep only activates in Power Save mode when display is off
 - Serial monitor may interfere with sleep; disconnect for true power measurement
 
