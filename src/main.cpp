@@ -25,32 +25,46 @@
 // =============================================================================
 
 // CO2 Thresholds (in ppm)
-#define CO2_THRESHOLD_GREEN   800   // Excellent
-#define CO2_THRESHOLD_YELLOW  1000  // Acceptable
-#define CO2_THRESHOLD_ORANGE  1400  // Poor
-#define CO2_THRESHOLD_RED     1600  // Unhealthy
+#define CO2_COLOR_LOW           COLOR_GREEN   // Excellent
+#define CO2_COLOR_MODERATE      COLOR_YELLOW  // Acceptable
+#define CO2_COLOR_HIGH          COLOR_ORANGE  // Poor
+#define CO2_COLOR_CRITICAL      COLOR_RED     // Unhealthy
+#define CO2_THRESHOLD_LOW       800
+#define CO2_THRESHOLD_MODERATE  1000
+#define CO2_THRESHOLD_HIGH      1200
+#define CO2_THRESHOLD_CRITICAL  1400
 
 // Temperature thresholds (in Celsius)
-#define TEMP_THRESHOLD_COLD   18.0  // Too cold
-#define TEMP_THRESHOLD_COOL   20.0  // Cool
-#define TEMP_THRESHOLD_WARM   25.0  // Warm
-#define TEMP_THRESHOLD_HOT    28.0  // Hot
+#define TEMP_COLOR_COLD         COLOR_BLUE    // Too cold
+#define TEMP_COLOR_COOL         COLOR_CYAN    // Cool
+#define TEMP_COLOR_OPTIMAL      COLOR_WHITE   // Optimal
+#define TEMP_COLOR_WARM         COLOR_YELLOW  // Warm
+#define TEMP_COLOR_HOT          COLOR_ORANGE  // Too hot
+#define TEMP_THRESHOLD_COLD     16.0
+#define TEMP_THRESHOLD_COOL     20.0
+#define TEMP_THRESHOLD_OPTIMAL  24.0
+#define TEMP_THRESHOLD_WARM     28.0
+
 
 // Humidity thresholds (in %)
-#define HUMID_THRESHOLD_DRY   30.0  // Too low
-#define HUMID_THRESHOLD_LOW   40.0  // Low
-#define HUMID_THRESHOLD_HIGH  60.0  // High
-#define HUMID_THRESHOLD_WET   70.0  // Too high
+#define HUMID_COLOR_DRY         COLOR_ORANGE  // Too dry
+#define HUMID_COLOR_LOW         COLOR_YELLOW  // Low
+#define HUMID_COLOR_OPTIMAL     COLOR_WHITE   // Optimal
+#define HUMID_COLOR_HIGH        COLOR_CYAN    // High
+#define HUMID_COLOR_WET         COLOR_BLUE    // Too wet
+#define HUMID_THRESHOLD_DRY     30.0
+#define HUMID_THRESHOLD_LOW     40.0
+#define HUMID_THRESHOLD_OPTIMAL 60.0
+#define HUMID_THRESHOLD_HIGH    70.0
 
 // Timing Configuration
 #define SENSOR_READ_INTERVAL  300000      // Read sensor every 5 minutes
-#define GRAPH_SAMPLE_INTERVAL 720000      // Store graph point every 12 minutes (24h / 120 points)
+#define GRAPH_SAMPLE_INTERVAL 300000      // Store graph point every 5 minutes (matches sensor interval)
 #define DISPLAY_TIMEOUT       10000       // Display timeout in warn mode (10 seconds)
 #define DEBOUNCE_DELAY        200         // Button debounce time (ms)
-#define GRAPH_START_HOUR      6           // Graph starts at 6:00 AM
 
 // Graph Configuration
-#define GRAPH_POINTS          120         // Number of data points in graph
+#define GRAPH_POINTS          288         // Number of data points in graph (24h at 5-min intervals)
 #define GRAPH_HEIGHT          80          // Height of graph area in pixels
 #define GRAPH_WIDTH           200         // Width of graph area in pixels
 
@@ -310,11 +324,11 @@ void initDisplay() {
   tft.setCursor(startX + 30, baseY);
   tft.print(" Monitor");
 
-  // "v0.1" - size 1, 4 chars * 6px = 24px wide
+  // Version - size 1, 4 chars * 6px = 24px wide
   tft.setTextColor(COLOR_LIGHT_GRAY);
   tft.setTextSize(1);
   tft.setCursor((240 - 24) / 2, 75);
-  tft.print("v0.2");
+  tft.print("v0.3");
 
   displayOn = true;
   lastDisplayActivity = millis();
@@ -564,15 +578,15 @@ void drawNumberView() {
 }
 
 void drawTrendArrow(int x, int y, int8_t trend, uint16_t color) {
+  // Equilateral triangle: height = width * √3/2 ≈ width * 0.866
+  int arrowWidth = 14;
+  int arrowHeight = 12;  // 14 * 0.866 ≈ 12
+
   if (trend == 0) {
-    // No change - draw horizontal line/dash
-    tft.drawFastHLine(x, y, 20, COLOR_DARK_GRAY);
+    // No change - draw a rectangular block
+    tft.fillRect(x, y - arrowHeight/4, arrowWidth, arrowHeight/2, color);
     return;
   }
-
-  // Arrow size
-  int arrowHeight = 16;
-  int arrowWidth = 12;
 
   if (trend > 0) {
     // Up arrow
@@ -694,8 +708,8 @@ void drawGraph() {
       }
       break;
     case DISPLAY_TEMPERATURE:
-      minVal = 15;
-      maxVal = 35;
+      minVal = 10;
+      maxVal = 30;
       break;
     case DISPLAY_HUMIDITY:
       minVal = 0;
@@ -707,48 +721,58 @@ void drawGraph() {
 
   // Always draw threshold lines (thin, colored)
   if (currentDisplayValue == DISPLAY_CO2) {
-    int yGreen = graphY + graphHeight - (int)(((CO2_THRESHOLD_GREEN - minVal) / (maxVal - minVal)) * graphHeight);
-    int yYellow = graphY + graphHeight - (int)(((CO2_THRESHOLD_YELLOW - minVal) / (maxVal - minVal)) * graphHeight);
-    int yOrange = graphY + graphHeight - (int)(((CO2_THRESHOLD_ORANGE - minVal) / (maxVal - minVal)) * graphHeight);
-    int yRed = graphY + graphHeight - (int)(((CO2_THRESHOLD_RED - minVal) / (maxVal - minVal)) * graphHeight);
-
-    if (yGreen > graphY && yGreen < graphY + graphHeight) {
-      tft.drawFastHLine(graphX, yGreen, graphWidth, COLOR_GREEN);
-    }
-    if (yYellow > graphY && yYellow < graphY + graphHeight) {
-      tft.drawFastHLine(graphX, yYellow, graphWidth, COLOR_YELLOW);
-    }
-    if (yOrange > graphY && yOrange < graphY + graphHeight) {
-      tft.drawFastHLine(graphX, yOrange, graphWidth, COLOR_ORANGE);
-    }
-    if (yRed > graphY && yRed < graphY + graphHeight) {
-      tft.drawFastHLine(graphX, yRed, graphWidth, COLOR_RED);
-    }
-  } else if (currentDisplayValue == DISPLAY_TEMPERATURE) {
-    // Temperature thresholds
-    int yCool = graphY + graphHeight - (int)(((TEMP_THRESHOLD_COOL - minVal) / (maxVal - minVal)) * graphHeight);
-    int yWarm = graphY + graphHeight - (int)(((TEMP_THRESHOLD_WARM - minVal) / (maxVal - minVal)) * graphHeight);
-    int yHot = graphY + graphHeight - (int)(((TEMP_THRESHOLD_HOT - minVal) / (maxVal - minVal)) * graphHeight);
-
-    if (yCool > graphY && yCool < graphY + graphHeight) {
-      tft.drawFastHLine(graphX, yCool, graphWidth, COLOR_CYAN);
-    }
-    if (yWarm > graphY && yWarm < graphY + graphHeight) {
-      tft.drawFastHLine(graphX, yWarm, graphWidth, COLOR_YELLOW);
-    }
-    if (yHot > graphY && yHot < graphY + graphHeight) {
-      tft.drawFastHLine(graphX, yHot, graphWidth, COLOR_ORANGE);
-    }
-  } else if (currentDisplayValue == DISPLAY_HUMIDITY) {
-    // Humidity thresholds
-    int yLow = graphY + graphHeight - (int)(((HUMID_THRESHOLD_LOW - minVal) / (maxVal - minVal)) * graphHeight);
-    int yHigh = graphY + graphHeight - (int)(((HUMID_THRESHOLD_HIGH - minVal) / (maxVal - minVal)) * graphHeight);
+    int yLow = graphY + graphHeight - (int)(((CO2_THRESHOLD_LOW - minVal) / (maxVal - minVal)) * graphHeight);
+    int yModerate = graphY + graphHeight - (int)(((CO2_THRESHOLD_MODERATE - minVal) / (maxVal - minVal)) * graphHeight);
+    int yHigh = graphY + graphHeight - (int)(((CO2_THRESHOLD_HIGH - minVal) / (maxVal - minVal)) * graphHeight);
+    int yCritical = graphY + graphHeight - (int)(((CO2_THRESHOLD_CRITICAL - minVal) / (maxVal - minVal)) * graphHeight);
 
     if (yLow > graphY && yLow < graphY + graphHeight) {
-      tft.drawFastHLine(graphX, yLow, graphWidth, COLOR_YELLOW);
+      tft.drawFastHLine(graphX, yLow, graphWidth, CO2_COLOR_LOW);
+    }
+    if (yModerate > graphY && yModerate < graphY + graphHeight) {
+      tft.drawFastHLine(graphX, yModerate, graphWidth, CO2_COLOR_MODERATE);
     }
     if (yHigh > graphY && yHigh < graphY + graphHeight) {
-      tft.drawFastHLine(graphX, yHigh, graphWidth, COLOR_CYAN);
+      tft.drawFastHLine(graphX, yHigh, graphWidth, CO2_COLOR_HIGH);
+    }
+    if (yCritical > graphY && yCritical < graphY + graphHeight) {
+      tft.drawFastHLine(graphX, yCritical, graphWidth, CO2_COLOR_CRITICAL);
+    }
+  } else if (currentDisplayValue == DISPLAY_TEMPERATURE) {
+    int yCold = graphY + graphHeight - (int)(((TEMP_THRESHOLD_COLD - minVal) / (maxVal - minVal)) * graphHeight);
+    int yCool = graphY + graphHeight - (int)(((TEMP_THRESHOLD_COOL - minVal) / (maxVal - minVal)) * graphHeight);
+    int yOptimal = graphY + graphHeight - (int)(((TEMP_THRESHOLD_OPTIMAL - minVal) / (maxVal - minVal)) * graphHeight);
+    int yWarm = graphY + graphHeight - (int)(((TEMP_THRESHOLD_WARM - minVal) / (maxVal - minVal)) * graphHeight);
+
+    if (yCold > graphY && yCold < graphY + graphHeight) {
+      tft.drawFastHLine(graphX, yCold, graphWidth, TEMP_COLOR_COLD);
+    }
+    if (yCool > graphY && yCool < graphY + graphHeight) {
+      tft.drawFastHLine(graphX, yCool, graphWidth, TEMP_COLOR_COOL);
+    }
+    if (yOptimal > graphY && yOptimal < graphY + graphHeight) {
+      tft.drawFastHLine(graphX, yOptimal, graphWidth, TEMP_COLOR_WARM);
+    }
+    if (yWarm > graphY && yWarm < graphY + graphHeight) {
+      tft.drawFastHLine(graphX, yWarm, graphWidth, TEMP_COLOR_HOT);
+    }
+  } else if (currentDisplayValue == DISPLAY_HUMIDITY) {
+    int yDry = graphY + graphHeight - (int)(((HUMID_THRESHOLD_DRY - minVal) / (maxVal - minVal)) * graphHeight);
+    int yLow = graphY + graphHeight - (int)(((HUMID_THRESHOLD_LOW - minVal) / (maxVal - minVal)) * graphHeight);
+    int yOptimal = graphY + graphHeight - (int)(((HUMID_THRESHOLD_OPTIMAL - minVal) / (maxVal - minVal)) * graphHeight);
+    int yHigh = graphY + graphHeight - (int)(((HUMID_THRESHOLD_HIGH - minVal) / (maxVal - minVal)) * graphHeight);
+
+    if (yDry > graphY && yDry < graphY + graphHeight) {
+      tft.drawFastHLine(graphX, yDry, graphWidth, HUMID_COLOR_DRY);
+    }
+    if (yLow > graphY && yLow < graphY + graphHeight) {
+      tft.drawFastHLine(graphX, yLow, graphWidth, HUMID_COLOR_LOW);
+    }
+    if (yOptimal > graphY && yOptimal < graphY + graphHeight) {
+      tft.drawFastHLine(graphX, yOptimal, graphWidth, HUMID_COLOR_HIGH);
+    }
+    if (yHigh > graphY && yHigh < graphY + graphHeight) {
+      tft.drawFastHLine(graphX, yHigh, graphWidth, HUMID_COLOR_WET);
     }
   }
 
@@ -941,28 +965,26 @@ int getBatteryPercent() {
 // =============================================================================
 
 uint16_t getCO2Color(uint16_t co2) {
-  if (co2 < CO2_THRESHOLD_GREEN) return COLOR_GREEN;
-  if (co2 < CO2_THRESHOLD_YELLOW) return COLOR_YELLOW;
-  if (co2 < CO2_THRESHOLD_ORANGE) return COLOR_ORANGE;
-  return COLOR_RED;
+  if (co2 < CO2_THRESHOLD_LOW) return CO2_COLOR_LOW;
+  if (co2 < CO2_THRESHOLD_MODERATE) return CO2_COLOR_MODERATE;
+  if (co2 < CO2_THRESHOLD_HIGH) return CO2_COLOR_HIGH;
+  return CO2_COLOR_CRITICAL;
 }
 
 uint16_t getTemperatureColor(float temp) {
-  // Diverging scale: blue (cold) -> cyan -> WHITE (optimal) -> yellow -> orange -> red (hot)
-  if (temp < TEMP_THRESHOLD_COLD) return COLOR_BLUE;
-  if (temp < TEMP_THRESHOLD_COOL) return COLOR_CYAN;
-  if (temp <= TEMP_THRESHOLD_WARM) return COLOR_WHITE;  // Optimal range
-  if (temp <= TEMP_THRESHOLD_HOT) return COLOR_YELLOW;
-  return COLOR_ORANGE;
+  if (temp < TEMP_THRESHOLD_COLD) return TEMP_COLOR_COLD;
+  if (temp < TEMP_THRESHOLD_COOL) return TEMP_COLOR_COOL;
+  if (temp < TEMP_THRESHOLD_OPTIMAL) return TEMP_COLOR_OPTIMAL;
+  if (temp < TEMP_THRESHOLD_WARM) return TEMP_COLOR_WARM;
+  return TEMP_COLOR_HOT;
 }
 
 uint16_t getHumidityColor(float humidity) {
-  // Diverging scale: orange (dry) -> yellow -> WHITE (optimal) -> cyan -> blue (wet)
-  if (humidity < HUMID_THRESHOLD_DRY) return COLOR_ORANGE;
-  if (humidity < HUMID_THRESHOLD_LOW) return COLOR_YELLOW;
-  if (humidity <= HUMID_THRESHOLD_HIGH) return COLOR_WHITE;  // Optimal range
-  if (humidity <= HUMID_THRESHOLD_WET) return COLOR_CYAN;
-  return COLOR_BLUE;
+  if (humidity < HUMID_THRESHOLD_DRY) return HUMID_COLOR_DRY;
+  if (humidity < HUMID_THRESHOLD_LOW) return HUMID_COLOR_LOW;
+  if (humidity < HUMID_THRESHOLD_OPTIMAL) return HUMID_COLOR_OPTIMAL;
+  if (humidity < HUMID_THRESHOLD_HIGH) return HUMID_COLOR_HIGH;
+  return HUMID_COLOR_WET;
 }
 
 // =============================================================================
@@ -1050,7 +1072,7 @@ bool shouldDisplayBeOn() {
   unsigned long currentMillis = millis();
 
   // Check if threshold is exceeded (CO2 only for warn mode)
-  bool thresholdExceeded = currentCO2 >= CO2_THRESHOLD_YELLOW;
+  bool thresholdExceeded = currentCO2 >= CO2_THRESHOLD_MODERATE;
 
   // Check if recent button activity
   bool recentActivity = (currentMillis - lastDisplayActivity) < DISPLAY_TIMEOUT;
