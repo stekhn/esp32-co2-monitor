@@ -2,8 +2,6 @@
 
 A firmware for monitoring indoor air quality using the Adafruit ESP32-S3 Reverse TFT Feather and SCD-41 CO2 sensor.
 
-**Version:** 0.4
-
 ## Hardware Required
 
 - [Adafruit ESP32-S3 Reverse TFT Feather](https://www.adafruit.com/product/5691)

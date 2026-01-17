@@ -30,6 +30,9 @@
 // CONFIGURATION - Adjust these values to customize behavior
 // =============================================================================
 
+// Firmware Version
+#define VERSION                 "0.6"
+
 // CO2 Thresholds (in ppm)
 #define CO2_COLOR_LOW           COLOR_GREEN   // Excellent
 #define CO2_COLOR_MODERATE      COLOR_YELLOW  // Acceptable
@@ -79,18 +82,29 @@
 #define BRIGHTNESS_DIM             64     // Dimmed brightness (~25%)
 
 // EMA Filter Configuration (alpha: 0=max smoothing, 1=no smoothing)
-#define EMA_ALPHA_CO2              0.3    // CO2 changes slowly, moderate smoothing
-#define EMA_ALPHA_TEMPERATURE      0.2    // Temperature is stable, more smoothing
-#define EMA_ALPHA_HUMIDITY         0.2    // Humidity is stable, more smoothing
+#define EMA_ALPHA_CO2              0.5    // CO2 changes slowly, moderate smoothing
+#define EMA_ALPHA_TEMPERATURE      0.5    // Temperature is stable, more smoothing
+#define EMA_ALPHA_HUMIDITY         0.5    // Humidity is stable, more smoothing
+
+// Trend Detection Thresholds (change required to show trend arrow)
+#define TREND_THRESHOLD_CO2        20     // ppm change for CO2 trend
+#define TREND_THRESHOLD_TEMP       0.3    // °C change for temperature trend
+#define TREND_THRESHOLD_HUMIDITY   2.0    // % change for humidity trend
 
 // SCD41 Sensor Configuration
-#define SCD41_TEMPERATURE_OFFSET   2      // Temperature offset in °C (sensor self-heating compensation)
+#define SCD41_TEMPERATURE_OFFSET   3.5    // Temperature offset in °C (positive values only, subtracted from reading)
 #define SCD41_ALTITUDE             525    // Altitude in meters (0 = sea level, set for your location)
 
 // Graph Configuration
 #define GRAPH_POINTS          288         // Number of data points in graph (24h at 5-min intervals)
 #define GRAPH_HEIGHT          80          // Height of graph area in pixels
 #define GRAPH_WIDTH           200         // Width of graph area in pixels
+#define GRAPH_CO2_MIN         400         // CO2 graph minimum (ppm)
+#define GRAPH_CO2_MAX         2500        // CO2 graph maximum (ppm)
+#define GRAPH_TEMP_MIN        10.0        // Temperature graph minimum (°C)
+#define GRAPH_TEMP_MAX        30.0        // Temperature graph maximum (°C)
+#define GRAPH_HUMIDITY_MIN    0.0         // Humidity graph minimum (%)
+#define GRAPH_HUMIDITY_MAX    100.0       // Humidity graph maximum (%)
 
 // Hardware Pins (ESP32-S3 Reverse TFT Feather)
 // TFT pins are defined by the board support package: TFT_CS, TFT_DC, TFT_RST, TFT_BACKLITE, TFT_I2C_POWER
@@ -110,7 +124,6 @@
 #define COLOR_GREEN       0x07E0
 #define COLOR_CYAN        0x07FF
 #define COLOR_BLUE        0x001F
-#define COLOR_PURPLE      0x780F
 #define COLOR_DARK_GRAY   0x4208
 #define COLOR_LIGHT_GRAY  0xC618
 
@@ -132,9 +145,9 @@ enum ViewMode {
 };
 
 enum DisplayMode {
-  MODE_BRIGHT,      // Full brightness, always on
-  MODE_DIM,         // Reduced brightness, always on
-  MODE_POWER_SAVE,  // Display off, turns on when threshold exceeded or button pressed
+  MODE_DAY,         // Full brightness, always on
+  MODE_NIGHT,       // Reduced brightness, always on
+  MODE_ECO,         // Display off, turns on when threshold exceeded or button pressed
   DISPLAY_MODE_COUNT
 };
 
@@ -164,7 +177,7 @@ float currentHumidity = 0.0;
 bool emaInitialized = false;  // First reading initializes EMA, subsequent readings are filtered
 
 // Graph history (circular buffer)
-uint16_t historyC02[GRAPH_POINTS] = {0};
+uint16_t historyCO2[GRAPH_POINTS] = {0};
 float historyTemperature[GRAPH_POINTS] = {0};
 float historyHumidity[GRAPH_POINTS] = {0};
 int historyIndex = 0;
@@ -173,7 +186,7 @@ int historyCount = 0;
 // UI State
 DisplayValue currentDisplayValue = DISPLAY_CO2;
 ViewMode currentViewMode = VIEW_NUMBER;
-DisplayMode currentDisplayMode = MODE_BRIGHT;
+DisplayMode currentDisplayMode = MODE_DAY;
 bool displayOn = true;
 
 // Timing
@@ -194,7 +207,7 @@ float prevTemperature = 0.0;
 float prevHumidity = 0.0;
 DisplayValue prevDisplayValue = DISPLAY_CO2;
 ViewMode prevViewMode = VIEW_NUMBER;
-DisplayMode prevDisplayMode = MODE_BRIGHT;
+DisplayMode prevDisplayMode = MODE_DAY;
 
 // Trend tracking (for arrow indicators)
 uint16_t trendCO2 = 0;
@@ -215,18 +228,17 @@ void updateHistory();
 void updateDisplay();
 void drawNumberView();
 void drawGraphView();
-void drawBigNumber(int value, const char* unit, uint16_t color);
-void drawBigNumberFloat(float value, const char* unit, uint16_t color);
 void drawSmallValues();
 void drawGraph();
 void drawStatusBar();
 uint16_t getCO2Color(uint16_t co2);
 uint16_t getTemperatureColor(float temp);
 uint16_t getHumidityColor(float humidity);
+void drawThresholdLine(int graphX, int graphY, int graphWidth, int graphHeight,
+                       float threshold, float minVal, float maxVal, uint16_t color);
 void handleButtons();
 void setDisplayPower(bool on);
 void setDisplayBrightness(int brightness);
-bool shouldDisplayBeOn();
 const char* getDisplayValueName(DisplayValue val);
 const char* getDisplayModeName(DisplayMode mode);
 void updateTrends();
@@ -303,7 +315,7 @@ void loop() {
     forceDisplayRefresh = true;  // Refresh display when new data arrives
 
     // Update hyperdrive state (only if not in Power Save mode)
-    if (currentDisplayMode != MODE_POWER_SAVE) {
+    if (currentDisplayMode != MODE_ECO) {
       updateHyperdrive();
     } else if (hyperdriveActive) {
       // Disable hyperdrive in Power Save mode
@@ -313,7 +325,8 @@ void loop() {
     }
 
     // In Power Save mode, turn on display briefly if threshold exceeded
-    if (currentDisplayMode == MODE_POWER_SAVE && currentCO2 >= CO2_THRESHOLD_HIGH) {
+    if (currentDisplayMode == MODE_ECO && currentCO2 >= CO2_THRESHOLD_HIGH) {
+      Serial.printf("CO2 threshold exceeded (%d >= %d), waking display\n", currentCO2, CO2_THRESHOLD_HIGH);
       lastDisplayActivity = currentMillis;
       if (!displayOn) {
         setDisplayPower(true);
@@ -328,22 +341,14 @@ void loop() {
   }
 
   // Handle display power in Power Save mode
-  if (currentDisplayMode == MODE_POWER_SAVE) {
-    bool shouldBeOn = shouldDisplayBeOn();
+  if (currentDisplayMode == MODE_ECO) {
+    unsigned long timeSinceActivity = currentMillis - lastDisplayActivity;
+    bool shouldBeOn = timeSinceActivity < DISPLAY_TIMEOUT;
     if (shouldBeOn != displayOn) {
+      Serial.printf("Power Save: timeSinceActivity=%lu, shouldBeOn=%d, displayOn=%d\n",
+                    timeSinceActivity, shouldBeOn, displayOn);
       setDisplayPower(shouldBeOn);
     }
-  }
-
-  // Handle brightness changes when switching between Bright and Dim modes
-  static DisplayMode lastBrightnessMode = MODE_BRIGHT;
-  if (currentDisplayMode != lastBrightnessMode && displayOn) {
-    if (currentDisplayMode == MODE_DIM) {
-      setDisplayBrightness(BRIGHTNESS_DIM);
-    } else if (currentDisplayMode == MODE_BRIGHT) {
-      setDisplayBrightness(BRIGHTNESS_HIGH);
-    }
-    lastBrightnessMode = currentDisplayMode;
   }
 
   // Update display (smart refresh - only redraws when values change)
@@ -352,14 +357,13 @@ void loop() {
     forceDisplayRefresh = false;
   }
 
-  // Use light sleep if display is off and we're waiting for next sensor read
-  if (!displayOn && currentDisplayMode == MODE_POWER_SAVE) {
-    unsigned long timeUntilNextRead = currentInterval - (millis() - lastSensorRead);
-    if (timeUntilNextRead > 1000) {
-      // Sleep for a portion of the remaining time, wake periodically to check buttons
-      enterLightSleep(min(timeUntilNextRead - 500, (unsigned long)10000));
-    }
-  }
+  // Light sleep disabled for debugging - uncomment when Power Save is working
+  // if (!displayOn && currentDisplayMode == MODE_ECO) {
+  //   unsigned long timeUntilNextRead = currentInterval - (millis() - lastSensorRead);
+  //   if (timeUntilNextRead > 1000) {
+  //     enterLightSleep(min(timeUntilNextRead - 500, (unsigned long)10000));
+  //   }
+  // }
 
   delay(100); // Small delay to prevent CPU hogging when awake
 }
@@ -413,7 +417,7 @@ void initDisplay() {
   tft.setTextColor(COLOR_LIGHT_GRAY);
   tft.setTextSize(1);
   tft.setCursor((240 - 24) / 2, 75);
-  tft.print("v0.5");
+  tft.print("v" VERSION);
 
   displayOn = true;
   lastDisplayActivity = millis();
@@ -560,30 +564,30 @@ void readSensor() {
 }
 
 void updateTrends() {
-  // CO2 trend (threshold: 20 ppm change)
-  if (currentCO2 > trendCO2 + 20) {
+  // CO2 trend
+  if (currentCO2 > trendCO2 + TREND_THRESHOLD_CO2) {
     co2Trend = 1;
-  } else if (currentCO2 < trendCO2 - 20) {
+  } else if (currentCO2 < trendCO2 - TREND_THRESHOLD_CO2) {
     co2Trend = -1;
   } else {
     co2Trend = 0;
   }
   trendCO2 = currentCO2;
 
-  // Temperature trend (threshold: 0.3°C change)
-  if (currentTemperature > trendTemperature + 0.3) {
+  // Temperature trend
+  if (currentTemperature > trendTemperature + TREND_THRESHOLD_TEMP) {
     tempTrend = 1;
-  } else if (currentTemperature < trendTemperature - 0.3) {
+  } else if (currentTemperature < trendTemperature - TREND_THRESHOLD_TEMP) {
     tempTrend = -1;
   } else {
     tempTrend = 0;
   }
   trendTemperature = currentTemperature;
 
-  // Humidity trend (threshold: 2% change)
-  if (currentHumidity > trendHumidity + 2.0) {
+  // Humidity trend
+  if (currentHumidity > trendHumidity + TREND_THRESHOLD_HUMIDITY) {
     humidTrend = 1;
-  } else if (currentHumidity < trendHumidity - 2.0) {
+  } else if (currentHumidity < trendHumidity - TREND_THRESHOLD_HUMIDITY) {
     humidTrend = -1;
   } else {
     humidTrend = 0;
@@ -592,7 +596,7 @@ void updateTrends() {
 }
 
 void updateHistory() {
-  historyC02[historyIndex] = currentCO2;
+  historyCO2[historyIndex] = currentCO2;
   historyTemperature[historyIndex] = currentTemperature;
   historyHumidity[historyIndex] = currentHumidity;
 
@@ -749,16 +753,6 @@ void drawTrendArrow(int x, int y, int8_t trend, uint16_t color) {
   }
 }
 
-void drawBigNumber(int value, const char* unit, uint16_t color) {
-  // Legacy function - now handled in drawNumberView
-  (void)value; (void)unit; (void)color;
-}
-
-void drawBigNumberFloat(float value, const char* unit, uint16_t color) {
-  // Legacy function - now handled in drawNumberView
-  (void)value; (void)unit; (void)color;
-}
-
 void drawSmallValues() {
   // Draw secondary readings: left-aligned on left, right-aligned on right
   // Position lower with more spacing from big value
@@ -843,79 +837,40 @@ void drawGraph() {
 
   switch (currentDisplayValue) {
     case DISPLAY_CO2:
-      minVal = 400;  // CO2 rarely goes below 400
-      maxVal = 2500; // Cap at 2500 for scale
+      minVal = GRAPH_CO2_MIN;
+      maxVal = GRAPH_CO2_MAX;
       for (int i = 0; i < historyCount; i++) {
-        if (historyC02[i] > maxVal) maxVal = historyC02[i];
+        if (historyCO2[i] > maxVal) maxVal = historyCO2[i];
       }
       break;
     case DISPLAY_TEMPERATURE:
-      minVal = 10;
-      maxVal = 30;
+      minVal = GRAPH_TEMP_MIN;
+      maxVal = GRAPH_TEMP_MAX;
       break;
     case DISPLAY_HUMIDITY:
-      minVal = 0;
-      maxVal = 100;
+      minVal = GRAPH_HUMIDITY_MIN;
+      maxVal = GRAPH_HUMIDITY_MAX;
       break;
     default:
       break;
   }
 
-  // Always draw threshold lines (thin, colored)
+  // Draw threshold lines
   if (currentDisplayValue == DISPLAY_CO2) {
-    int yLow = graphY + graphHeight - (int)(((CO2_THRESHOLD_LOW - minVal) / (maxVal - minVal)) * graphHeight);
-    int yModerate = graphY + graphHeight - (int)(((CO2_THRESHOLD_MODERATE - minVal) / (maxVal - minVal)) * graphHeight);
-    int yHigh = graphY + graphHeight - (int)(((CO2_THRESHOLD_HIGH - minVal) / (maxVal - minVal)) * graphHeight);
-    int yCritical = graphY + graphHeight - (int)(((CO2_THRESHOLD_CRITICAL - minVal) / (maxVal - minVal)) * graphHeight);
-
-    if (yLow > graphY && yLow < graphY + graphHeight) {
-      tft.drawFastHLine(graphX, yLow, graphWidth, CO2_COLOR_LOW);
-    }
-    if (yModerate > graphY && yModerate < graphY + graphHeight) {
-      tft.drawFastHLine(graphX, yModerate, graphWidth, CO2_COLOR_MODERATE);
-    }
-    if (yHigh > graphY && yHigh < graphY + graphHeight) {
-      tft.drawFastHLine(graphX, yHigh, graphWidth, CO2_COLOR_HIGH);
-    }
-    if (yCritical > graphY && yCritical < graphY + graphHeight) {
-      tft.drawFastHLine(graphX, yCritical, graphWidth, CO2_COLOR_CRITICAL);
-    }
+    drawThresholdLine(graphX, graphY, graphWidth, graphHeight, CO2_THRESHOLD_LOW, minVal, maxVal, CO2_COLOR_LOW);
+    drawThresholdLine(graphX, graphY, graphWidth, graphHeight, CO2_THRESHOLD_MODERATE, minVal, maxVal, CO2_COLOR_MODERATE);
+    drawThresholdLine(graphX, graphY, graphWidth, graphHeight, CO2_THRESHOLD_HIGH, minVal, maxVal, CO2_COLOR_HIGH);
+    drawThresholdLine(graphX, graphY, graphWidth, graphHeight, CO2_THRESHOLD_CRITICAL, minVal, maxVal, CO2_COLOR_CRITICAL);
   } else if (currentDisplayValue == DISPLAY_TEMPERATURE) {
-    int yCold = graphY + graphHeight - (int)(((TEMP_THRESHOLD_COLD - minVal) / (maxVal - minVal)) * graphHeight);
-    int yCool = graphY + graphHeight - (int)(((TEMP_THRESHOLD_COOL - minVal) / (maxVal - minVal)) * graphHeight);
-    int yOptimal = graphY + graphHeight - (int)(((TEMP_THRESHOLD_OPTIMAL - minVal) / (maxVal - minVal)) * graphHeight);
-    int yWarm = graphY + graphHeight - (int)(((TEMP_THRESHOLD_WARM - minVal) / (maxVal - minVal)) * graphHeight);
-
-    if (yCold > graphY && yCold < graphY + graphHeight) {
-      tft.drawFastHLine(graphX, yCold, graphWidth, TEMP_COLOR_COLD);
-    }
-    if (yCool > graphY && yCool < graphY + graphHeight) {
-      tft.drawFastHLine(graphX, yCool, graphWidth, TEMP_COLOR_COOL);
-    }
-    if (yOptimal > graphY && yOptimal < graphY + graphHeight) {
-      tft.drawFastHLine(graphX, yOptimal, graphWidth, TEMP_COLOR_WARM);
-    }
-    if (yWarm > graphY && yWarm < graphY + graphHeight) {
-      tft.drawFastHLine(graphX, yWarm, graphWidth, TEMP_COLOR_HOT);
-    }
+    drawThresholdLine(graphX, graphY, graphWidth, graphHeight, TEMP_THRESHOLD_COLD, minVal, maxVal, TEMP_COLOR_COLD);
+    drawThresholdLine(graphX, graphY, graphWidth, graphHeight, TEMP_THRESHOLD_COOL, minVal, maxVal, TEMP_COLOR_COOL);
+    drawThresholdLine(graphX, graphY, graphWidth, graphHeight, TEMP_THRESHOLD_OPTIMAL, minVal, maxVal, TEMP_COLOR_WARM);
+    drawThresholdLine(graphX, graphY, graphWidth, graphHeight, TEMP_THRESHOLD_WARM, minVal, maxVal, TEMP_COLOR_HOT);
   } else if (currentDisplayValue == DISPLAY_HUMIDITY) {
-    int yDry = graphY + graphHeight - (int)(((HUMID_THRESHOLD_DRY - minVal) / (maxVal - minVal)) * graphHeight);
-    int yLow = graphY + graphHeight - (int)(((HUMID_THRESHOLD_LOW - minVal) / (maxVal - minVal)) * graphHeight);
-    int yOptimal = graphY + graphHeight - (int)(((HUMID_THRESHOLD_OPTIMAL - minVal) / (maxVal - minVal)) * graphHeight);
-    int yHigh = graphY + graphHeight - (int)(((HUMID_THRESHOLD_HIGH - minVal) / (maxVal - minVal)) * graphHeight);
-
-    if (yDry > graphY && yDry < graphY + graphHeight) {
-      tft.drawFastHLine(graphX, yDry, graphWidth, HUMID_COLOR_DRY);
-    }
-    if (yLow > graphY && yLow < graphY + graphHeight) {
-      tft.drawFastHLine(graphX, yLow, graphWidth, HUMID_COLOR_LOW);
-    }
-    if (yOptimal > graphY && yOptimal < graphY + graphHeight) {
-      tft.drawFastHLine(graphX, yOptimal, graphWidth, HUMID_COLOR_HIGH);
-    }
-    if (yHigh > graphY && yHigh < graphY + graphHeight) {
-      tft.drawFastHLine(graphX, yHigh, graphWidth, HUMID_COLOR_WET);
-    }
+    drawThresholdLine(graphX, graphY, graphWidth, graphHeight, HUMID_THRESHOLD_DRY, minVal, maxVal, HUMID_COLOR_DRY);
+    drawThresholdLine(graphX, graphY, graphWidth, graphHeight, HUMID_THRESHOLD_LOW, minVal, maxVal, HUMID_COLOR_LOW);
+    drawThresholdLine(graphX, graphY, graphWidth, graphHeight, HUMID_THRESHOLD_OPTIMAL, minVal, maxVal, HUMID_COLOR_HIGH);
+    drawThresholdLine(graphX, graphY, graphWidth, graphHeight, HUMID_THRESHOLD_HIGH, minVal, maxVal, HUMID_COLOR_WET);
   }
 
   // Draw the graph line in white (always a line, no dots)
@@ -931,8 +886,8 @@ void drawGraph() {
 
       switch (currentDisplayValue) {
         case DISPLAY_CO2:
-          val0 = historyC02[idx0];
-          val1 = historyC02[idx1];
+          val0 = historyCO2[idx0];
+          val1 = historyCO2[idx1];
           break;
         case DISPLAY_TEMPERATURE:
           val0 = historyTemperature[idx0];
@@ -1032,10 +987,10 @@ void drawStatusBar() {
   // Center: Mode icon + display mode + hyperdrive indicator
   const char* modeLabel;
   switch (currentDisplayMode) {
-    case MODE_BRIGHT:     modeLabel = "BRIGHT"; break;
-    case MODE_DIM:        modeLabel = "DIM"; break;
-    case MODE_POWER_SAVE: modeLabel = "PWR SAVE"; break;
-    default:              modeLabel = ""; break;
+    case MODE_DAY:   modeLabel = "DAY"; break;
+    case MODE_NIGHT: modeLabel = "NIGHT"; break;
+    case MODE_ECO:   modeLabel = "ECO"; break;
+    default:         modeLabel = ""; break;
   }
 
   // Calculate total width: icon (10px) + gap (3px) + text
@@ -1065,30 +1020,42 @@ void drawStatusBar() {
     );
   } else {
     switch (currentDisplayMode) {
-      case MODE_BRIGHT:
-        // Sun icon: filled circle with rays
-        tft.fillCircle(startX + 4, iconCenterY, 3, modeColor);
-        // Small rays
-        tft.drawPixel(startX + 4, iconCenterY - 5, modeColor);
-        tft.drawPixel(startX + 4, iconCenterY + 5, modeColor);
-        tft.drawPixel(startX - 1, iconCenterY, modeColor);
-        tft.drawPixel(startX + 9, iconCenterY, modeColor);
+      case MODE_DAY:
+        // Sun icon: small filled circle with visible rays
+        tft.fillCircle(startX + 4, iconCenterY, 2, modeColor);
+        // Cardinal rays (short lines)
+        tft.drawFastVLine(startX + 4, iconCenterY - 6, 2, modeColor);  // Top
+        tft.drawFastVLine(startX + 4, iconCenterY + 5, 2, modeColor);  // Bottom
+        tft.drawFastHLine(startX - 2, iconCenterY, 2, modeColor);      // Left
+        tft.drawFastHLine(startX + 9, iconCenterY, 2, modeColor);      // Right
+        // Diagonal rays
+        tft.drawPixel(startX, iconCenterY - 4, modeColor);
+        tft.drawPixel(startX + 8, iconCenterY - 4, modeColor);
+        tft.drawPixel(startX, iconCenterY + 4, modeColor);
+        tft.drawPixel(startX + 8, iconCenterY + 4, modeColor);
         break;
-      case MODE_DIM:
+      case MODE_NIGHT:
         // Moon icon: crescent shape
         tft.fillCircle(startX + 4, iconCenterY, 4, modeColor);
         tft.fillCircle(startX + 6, iconCenterY - 1, 3, COLOR_BLACK);  // Cut out crescent
         break;
-      case MODE_POWER_SAVE:
-        // Leaf icon - teardrop shape with stem
-        tft.fillCircle(startX + 5, iconCenterY - 1, 3, modeColor);  // Round part
+      case MODE_ECO:
+        // Leaf icon - simple oval leaf with stem
+        // Leaf body (tilted ellipse using two triangles)
         tft.fillTriangle(
-          startX + 2, iconCenterY - 1,   // Left of circle
-          startX + 8, iconCenterY - 1,   // Right of circle
-          startX + 5, iconCenterY + 4,   // Bottom tip
+          startX + 2, iconCenterY + 2,   // Bottom left
+          startX + 5, iconCenterY - 4,   // Top tip
+          startX + 8, iconCenterY,       // Right side
           modeColor
         );
-        tft.drawLine(startX + 5, iconCenterY + 4, startX + 3, iconCenterY + 6, modeColor);  // Stem
+        tft.fillTriangle(
+          startX + 2, iconCenterY + 2,   // Bottom left
+          startX + 8, iconCenterY,       // Right side
+          startX + 5, iconCenterY + 3,   // Bottom curve
+          modeColor
+        );
+        // Stem
+        tft.drawLine(startX + 2, iconCenterY + 2, startX + 1, iconCenterY + 5, modeColor);
         break;
       default:
         break;
@@ -1149,6 +1116,18 @@ int getBatteryPercent() {
 }
 
 // =============================================================================
+// GRAPH HELPER FUNCTIONS
+// =============================================================================
+
+void drawThresholdLine(int graphX, int graphY, int graphWidth, int graphHeight,
+                       float threshold, float minVal, float maxVal, uint16_t color) {
+  int y = graphY + graphHeight - (int)(((threshold - minVal) / (maxVal - minVal)) * graphHeight);
+  if (y > graphY && y < graphY + graphHeight) {
+    tft.drawFastHLine(graphX, y, graphWidth, color);
+  }
+}
+
+// =============================================================================
 // COLOR FUNCTIONS
 // =============================================================================
 
@@ -1182,58 +1161,88 @@ uint16_t getHumidityColor(float humidity) {
 void handleButtons() {
   unsigned long currentMillis = millis();
 
+  // Static flags to track if button action was already handled (require release before next action)
+  static bool button0Handled = false;
+  static bool button1Handled = false;
+  static bool button2Handled = false;
+
   // Button D0 - Cycle through display values (CO2 -> Temp -> Humidity)
-  // D0 is pulled HIGH, goes LOW when pressed
-  if (digitalRead(BUTTON_D0) == LOW) {
-    if (currentMillis - lastButtonPress[0] >= DEBOUNCE_DELAY) {
-      currentDisplayValue = (DisplayValue)((currentDisplayValue + 1) % DISPLAY_VALUE_COUNT);
-      lastDisplayActivity = currentMillis;
+  // In Power Save mode, D0 only wakes/resets timeout (never cycles values)
+  bool button0Pressed = (digitalRead(BUTTON_D0) == LOW);
+  if (button0Pressed) {
+    if (!button0Handled && (currentMillis - lastButtonPress[0] >= DEBOUNCE_DELAY)) {
       lastButtonPress[0] = currentMillis;
-      forceDisplayRefresh = true;
+      button0Handled = true;
 
-      Serial.printf("Display value: %s\n", getDisplayValueName(currentDisplayValue));
-
-      // Wake display if in Power Save mode
-      if (currentDisplayMode == MODE_POWER_SAVE && !displayOn) {
-        setDisplayPower(true);
+      if (currentDisplayMode == MODE_ECO) {
+        // Power Save mode: D0 only wakes display or resets timeout
+        lastDisplayActivity = currentMillis;
+        if (!displayOn) {
+          setDisplayPower(true);
+          Serial.println("Button D0: Wake display");
+        } else {
+          Serial.println("Button D0: Reset display timeout");
+        }
+      } else {
+        // Normal modes: D0 cycles display value
+        currentDisplayValue = (DisplayValue)((currentDisplayValue + 1) % DISPLAY_VALUE_COUNT);
+        lastDisplayActivity = currentMillis;
+        forceDisplayRefresh = true;
+        Serial.printf("Display value: %s\n", getDisplayValueName(currentDisplayValue));
       }
     }
+  } else {
+    button0Handled = false;
   }
 
   // Button D1 - Toggle between number and graph view
-  // D1 is pulled LOW, goes HIGH when pressed
-  if (digitalRead(BUTTON_D1) == HIGH) {
-    if (currentMillis - lastButtonPress[1] >= DEBOUNCE_DELAY) {
-      currentViewMode = (ViewMode)((currentViewMode + 1) % VIEW_MODE_COUNT);
-      lastDisplayActivity = currentMillis;
+  bool button1Pressed = (digitalRead(BUTTON_D1) == HIGH);
+  if (button1Pressed) {
+    if (!button1Handled && (currentMillis - lastButtonPress[1] >= DEBOUNCE_DELAY)) {
       lastButtonPress[1] = currentMillis;
-      forceDisplayRefresh = true;
+      button1Handled = true;
 
-      Serial.printf("View mode: %s\n", currentViewMode == VIEW_NUMBER ? "Number" : "Graph");
-
-      // Wake display if in Power Save mode
-      if (currentDisplayMode == MODE_POWER_SAVE && !displayOn) {
+      if (currentDisplayMode == MODE_ECO && !displayOn) {
+        lastDisplayActivity = currentMillis;
         setDisplayPower(true);
+        Serial.println("Button D1: Wake display");
+      } else {
+        currentViewMode = (ViewMode)((currentViewMode + 1) % VIEW_MODE_COUNT);
+        lastDisplayActivity = currentMillis;
+        forceDisplayRefresh = true;
+        Serial.printf("View mode: %s\n", currentViewMode == VIEW_NUMBER ? "Number" : "Graph");
       }
     }
+  } else {
+    button1Handled = false;
   }
 
   // Button D2 - Cycle through display modes (Bright -> Dim -> Power Save)
-  // D2 is pulled LOW, goes HIGH when pressed
-  if (digitalRead(BUTTON_D2) == HIGH) {
-    if (currentMillis - lastButtonPress[2] >= DEBOUNCE_DELAY) {
+  bool button2Pressed = (digitalRead(BUTTON_D2) == HIGH);
+  if (button2Pressed) {
+    if (!button2Handled && (currentMillis - lastButtonPress[2] >= DEBOUNCE_DELAY)) {
+      lastButtonPress[2] = currentMillis;
+      button2Handled = true;
+
       currentDisplayMode = (DisplayMode)((currentDisplayMode + 1) % DISPLAY_MODE_COUNT);
       lastDisplayActivity = currentMillis;
       forceDisplayRefresh = true;
-      lastButtonPress[2] = currentMillis;
-
       Serial.printf("Display mode: %s\n", getDisplayModeName(currentDisplayMode));
+
+      // Set brightness based on new mode (only for BRIGHT and DIM)
+      if (currentDisplayMode == MODE_DAY) {
+        setDisplayBrightness(BRIGHTNESS_HIGH);
+      } else if (currentDisplayMode == MODE_NIGHT) {
+        setDisplayBrightness(BRIGHTNESS_DIM);
+      }
 
       // Ensure display is on when changing modes
       if (!displayOn) {
         setDisplayPower(true);
       }
     }
+  } else {
+    button2Handled = false;
   }
 }
 
@@ -1247,15 +1256,30 @@ void setDisplayPower(bool on) {
   displayOn = on;
 
   if (on) {
-    // Set brightness based on display mode
-    int brightness = (currentDisplayMode == MODE_DIM) ? BRIGHTNESS_DIM : BRIGHTNESS_HIGH;
+    // Clear screen and set brightness based on mode
+    tft.fillScreen(COLOR_BLACK);
+    int brightness;
+    if (currentDisplayMode == MODE_NIGHT) {
+      brightness = BRIGHTNESS_DIM;
+    } else if (currentDisplayMode == MODE_ECO) {
+      brightness = BRIGHTNESS_DIM;  // Use dim brightness when waking in Power Save
+    } else {
+      brightness = BRIGHTNESS_HIGH;
+    }
     analogWrite(TFT_BACKLITE, brightness);
-    lastDisplayActivity = millis();
-    // Force full redraw
-    prevViewMode = (ViewMode)255;
+    lastDisplayActivity = millis();  // Reset timeout when display turns on
+    forceDisplayRefresh = true;
   } else {
     analogWrite(TFT_BACKLITE, 0);
   }
+
+  // IMPORTANT: Reset button debounce timers after display state change
+  // GPIO 0 (boot button) is a strapping pin prone to noise during power transitions
+  // This prevents spurious button triggers from electrical noise
+  unsigned long now = millis();
+  lastButtonPress[0] = now;
+  lastButtonPress[1] = now;
+  lastButtonPress[2] = now;
 
   Serial.printf("Display: %s\n", on ? "ON" : "OFF");
 }
@@ -1264,15 +1288,6 @@ void setDisplayBrightness(int brightness) {
   if (displayOn) {
     analogWrite(TFT_BACKLITE, brightness);
   }
-}
-
-bool shouldDisplayBeOn() {
-  unsigned long currentMillis = millis();
-
-  // Check if recent activity (button press or threshold trigger)
-  bool recentActivity = (currentMillis - lastDisplayActivity) < DISPLAY_TIMEOUT;
-
-  return recentActivity;
 }
 
 // =============================================================================
@@ -1290,9 +1305,9 @@ const char* getDisplayValueName(DisplayValue val) {
 
 const char* getDisplayModeName(DisplayMode mode) {
   switch (mode) {
-    case MODE_BRIGHT: return "BRIGHT";
-    case MODE_DIM: return "DIM";
-    case MODE_POWER_SAVE: return "POWER SAVE";
+    case MODE_DAY: return "DAY";
+    case MODE_NIGHT: return "NIGHT";
+    case MODE_ECO: return "ECO";
     default: return "Unknown";
   }
 }
@@ -1392,7 +1407,13 @@ void enterLightSleep(unsigned long duration_ms) {
 
   if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) {
     Serial.println("Woke up from button press");
-    lastDisplayActivity = millis();  // Mark activity for display timeout
+    unsigned long now = millis();
+    lastDisplayActivity = now;
+    lastButtonPress[0] = now;
+    // Turn on display immediately when waking from button press
+    if (!displayOn) {
+      setDisplayPower(true);
+    }
   } else if (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) {
     Serial.println("Woke up from timer");
   }
