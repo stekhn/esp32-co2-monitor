@@ -31,7 +31,7 @@
 // =============================================================================
 
 // Firmware Version
-#define VERSION                 "0.6"
+#define VERSION                 "0.7"
 
 // CO2 Thresholds (in ppm)
 #define CO2_COLOR_LOW           COLOR_GREEN   // Excellent
@@ -140,6 +140,7 @@ enum DisplayValue {
 
 enum ViewMode {
   VIEW_NUMBER,
+  VIEW_DASHBOARD,
   VIEW_GRAPH,
   VIEW_MODE_COUNT
 };
@@ -227,10 +228,14 @@ void readSensor();
 void updateHistory();
 void updateDisplay();
 void drawNumberView();
+void drawDashboardView();
 void drawGraphView();
 void drawSmallValues();
 void drawGraph();
 void drawStatusBar();
+uint16_t getContrastColor(uint16_t bgColor);
+void drawTile(int x, int y, int w, int h, const char* label, const char* value,
+              int8_t trend, uint16_t bgColor, int cornerRadius);
 uint16_t getCO2Color(uint16_t co2);
 uint16_t getTemperatureColor(float temp);
 uint16_t getHumidityColor(float humidity);
@@ -630,10 +635,18 @@ void updateDisplay() {
     tft.fillScreen(COLOR_BLACK);
   }
 
-  if (currentViewMode == VIEW_NUMBER) {
-    drawNumberView();
-  } else {
-    drawGraphView();
+  switch (currentViewMode) {
+    case VIEW_NUMBER:
+      drawNumberView();
+      break;
+    case VIEW_DASHBOARD:
+      drawDashboardView();
+      break;
+    case VIEW_GRAPH:
+      drawGraphView();
+      break;
+    default:
+      break;
   }
 
   drawStatusBar();
@@ -817,6 +830,162 @@ void drawSmallValues() {
   tft.print(rightLabel);
 }
 
+// =============================================================================
+// DASHBOARD VIEW
+// =============================================================================
+
+uint16_t getContrastColor(uint16_t bgColor) {
+  // Extract RGB565 components
+  uint8_t r5 = (bgColor >> 11) & 0x1F;  // 0-31
+  uint8_t g6 = (bgColor >> 5) & 0x3F;   // 0-63
+  uint8_t b5 = bgColor & 0x1F;          // 0-31
+
+  // Convert to approximate 8-bit values
+  uint8_t r = (r5 << 3);
+  uint8_t g = (g6 << 2);
+  uint8_t b = (b5 << 3);
+
+  // Calculate perceived luminance (ITU-R BT.601)
+  int luminance = (r * 299 + g * 587 + b * 114) / 1000;
+
+  return (luminance > 140) ? COLOR_BLACK : COLOR_WHITE;
+}
+
+void drawTile(int x, int y, int w, int h, const char* label, const char* value,
+              int8_t trend, uint16_t outlineColor, int cornerRadius) {
+  // Draw rounded rectangle outline (2px thick for visibility)
+  tft.drawRoundRect(x, y, w, h, cornerRadius, outlineColor);
+  tft.drawRoundRect(x + 1, y + 1, w - 2, h - 2, cornerRadius - 1, outlineColor);
+
+  // Draw label - centered horizontally, upper portion, same color as outline
+  // Faux bold: draw twice with 1px horizontal offset
+  tft.setTextColor(outlineColor);
+  tft.setTextSize(2);
+  int labelWidth = strlen(label) * 12;
+  int labelX = x + (w - labelWidth) / 2;
+  int labelY = y + 8;
+  tft.setCursor(labelX, labelY);
+  tft.print(label);
+  tft.setCursor(labelX + 1, labelY);
+  tft.print(label);
+
+  // Draw value - centered, lower portion, white text
+  tft.setTextColor(COLOR_WHITE);
+  tft.setTextSize(1);
+  int valueWidth = strlen(value) * 6;
+  int valueY = y + h - 18;
+  tft.setCursor(x + (w - valueWidth) / 2, valueY);
+  tft.print(value);
+
+  // Draw small trend arrow - bottom right corner with spacing from outline
+  if (trend != 0) {
+    int arrowW = 8;
+    int arrowH = 7;
+    int arrowX = x + w - arrowW - 6;  // 6px from right edge
+    int arrowY = y + h - arrowH - 6;  // 6px from bottom edge
+
+    if (trend > 0) {
+      tft.fillTriangle(
+        arrowX + arrowW / 2, arrowY,              // Top point
+        arrowX, arrowY + arrowH,                  // Bottom left
+        arrowX + arrowW, arrowY + arrowH,         // Bottom right
+        outlineColor
+      );
+    } else {
+      tft.fillTriangle(
+        arrowX + arrowW / 2, arrowY + arrowH,     // Bottom point
+        arrowX, arrowY,                           // Top left
+        arrowX + arrowW, arrowY,                  // Top right
+        outlineColor
+      );
+    }
+  }
+}
+
+void drawDashboardView() {
+  // Clear display area (below status bar)
+  tft.fillRect(0, 18, 240, 117, COLOR_BLACK);
+
+  // Tile layout: 2x2 grid
+  // Available area: 240x117 (y: 18-135)
+  int margin = 5;
+  int tileW = (240 - margin * 3) / 2;   // ~113px
+  int tileH = (117 - margin * 3) / 2;   // ~52px
+  int cornerRadius = 5;
+  int startY = 18 + margin;
+
+  char valueStr[16];
+
+  // Tile data for all metrics
+  struct TileData {
+    const char* label;
+    char value[16];
+    int8_t trend;
+    uint16_t color;
+  };
+
+  TileData tiles[3];
+
+  // CO2
+  tiles[0].label = "CO2";
+  snprintf(tiles[0].value, sizeof(tiles[0].value), "%d ppm", currentCO2);
+  tiles[0].trend = co2Trend;
+  tiles[0].color = getCO2Color(currentCO2);
+
+  // Temperature
+  tiles[1].label = "Temp";
+  snprintf(tiles[1].value, sizeof(tiles[1].value), "%.1f C", currentTemperature);
+  tiles[1].trend = tempTrend;
+  tiles[1].color = getTemperatureColor(currentTemperature);
+
+  // Humidity
+  tiles[2].label = "Humid";
+  snprintf(tiles[2].value, sizeof(tiles[2].value), "%.0f %%", currentHumidity);
+  tiles[2].trend = humidTrend;
+  tiles[2].color = getHumidityColor(currentHumidity);
+
+  // Reorder tiles based on currentDisplayValue (selected metric first)
+  int order[3];
+  order[0] = (int)currentDisplayValue;
+  order[1] = (currentDisplayValue + 1) % 3;
+  order[2] = (currentDisplayValue + 2) % 3;
+
+  // Draw tiles in order: selected first (top-left), then others
+  // Top-left
+  drawTile(margin, startY, tileW, tileH,
+           tiles[order[0]].label, tiles[order[0]].value,
+           tiles[order[0]].trend, tiles[order[0]].color, cornerRadius);
+
+  // Top-right
+  drawTile(margin * 2 + tileW, startY, tileW, tileH,
+           tiles[order[1]].label, tiles[order[1]].value,
+           tiles[order[1]].trend, tiles[order[1]].color, cornerRadius);
+
+  // Bottom-left
+  drawTile(margin, startY + tileH + margin, tileW, tileH,
+           tiles[order[2]].label, tiles[order[2]].value,
+           tiles[order[2]].trend, tiles[order[2]].color, cornerRadius);
+
+  // Bottom-right: Battery
+  int batteryPercent = getBatteryPercent();
+  uint16_t batteryColor;
+  if (batteryPercent < 0) {
+    snprintf(valueStr, sizeof(valueStr), "USB");
+    batteryColor = COLOR_DARK_GRAY;
+  } else if (batteryPercent < 20) {
+    snprintf(valueStr, sizeof(valueStr), "%d %%", batteryPercent);
+    batteryColor = COLOR_RED;
+  } else if (batteryPercent < 50) {
+    snprintf(valueStr, sizeof(valueStr), "%d %%", batteryPercent);
+    batteryColor = COLOR_ORANGE;
+  } else {
+    snprintf(valueStr, sizeof(valueStr), "%d %%", batteryPercent);
+    batteryColor = COLOR_GREEN;
+  }
+  drawTile(margin * 2 + tileW, startY + tileH + margin, tileW, tileH,
+           "Batt", valueStr, 0, batteryColor, cornerRadius);
+}
+
 void drawGraphView() {
   // Clear display area (below status bar at top)
   tft.fillRect(0, 18, 240, 117, COLOR_BLACK);
@@ -963,11 +1132,11 @@ void drawStatusBar() {
       metricLabel = "CO2";
       break;
     case DISPLAY_TEMPERATURE:
-      metricColor = COLOR_WHITE;
+      metricColor = getTemperatureColor(currentTemperature);
       metricLabel = "TEMP";
       break;
     case DISPLAY_HUMIDITY:
-      metricColor = COLOR_CYAN;
+      metricColor = getHumidityColor(currentHumidity);
       metricLabel = "HUMID";
       break;
     default:
@@ -993,9 +1162,9 @@ void drawStatusBar() {
     default:         modeLabel = ""; break;
   }
 
-  // Calculate total width: icon (10px) + gap (3px) + text
-  int iconWidth = 10;
-  int gap = 3;
+  // Calculate total width: icon (12px) + gap (5px) + text
+  int iconWidth = 12;
+  int gap = 5;
   int textWidth = strlen(modeLabel) * 6;
   int totalWidth = iconWidth + gap + textWidth;
   int startX = 120 - totalWidth / 2;
@@ -1100,7 +1269,7 @@ void drawStatusBar() {
   }
 
   // Draw battery text
-  tft.setTextColor(COLOR_WHITE);
+  tft.setTextColor(batteryColor);
   tft.setCursor(210, textY);
   tft.print(batteryStr);
 }
@@ -1210,7 +1379,8 @@ void handleButtons() {
         currentViewMode = (ViewMode)((currentViewMode + 1) % VIEW_MODE_COUNT);
         lastDisplayActivity = currentMillis;
         forceDisplayRefresh = true;
-        Serial.printf("View mode: %s\n", currentViewMode == VIEW_NUMBER ? "Number" : "Graph");
+        const char* viewNames[] = {"Number", "Dashboard", "Graph"};
+        Serial.printf("View mode: %s\n", viewNames[currentViewMode]);
       }
     }
   } else {
