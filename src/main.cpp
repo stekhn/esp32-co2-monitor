@@ -31,7 +31,7 @@
 // =============================================================================
 
 // Firmware Version
-#define VERSION                 "0.7"
+#define VERSION                 "0.8"
 
 // CO2 Thresholds (in ppm)
 #define CO2_COLOR_LOW           COLOR_GREEN   // Excellent
@@ -202,6 +202,9 @@ bool hyperdriveActive = true;      // Start in hyperdrive for quick initial read
 uint16_t lastHyperdriveCO2 = 0;    // CO2 reading used for hyperdrive comparison
 int hyperdriveStableCount = 0;     // Count of consecutive stable readings
 
+// Sensor power mode
+bool sensorSingleShotMode = false; // True when using single shot instead of periodic
+
 // Previous values for display update optimization
 uint16_t prevCO2 = 0;
 float prevTemperature = 0.0;
@@ -252,15 +255,19 @@ int getBatteryPercent();
 void initPowerSaving();
 void updateHyperdrive();
 void enterLightSleep(unsigned long duration_ms);
+void setSensorMode(bool singleShot);
 
 // =============================================================================
 // SETUP
 // =============================================================================
 
 void setup() {
+  // Reduce CPU frequency from 240MHz to 80MHz to save power (~35mA savings)
+  setCpuFrequencyMhz(80);
+
   Serial.begin(115200);
   delay(1000);
-  Serial.println("ESP32-S3 CO2 Monitor Starting...");
+  Serial.printf("ESP32-S3 CO2 Monitor Starting... (CPU: %d MHz)\n", getCpuFrequencyMhz());
 
   // Initialize power saving (disable WiFi, Bluetooth, unused GPIOs)
   initPowerSaving();
@@ -362,15 +369,23 @@ void loop() {
     forceDisplayRefresh = false;
   }
 
-  // Light sleep disabled for debugging - uncomment when Power Save is working
-  // if (!displayOn && currentDisplayMode == MODE_ECO) {
-  //   unsigned long timeUntilNextRead = currentInterval - (millis() - lastSensorRead);
-  //   if (timeUntilNextRead > 1000) {
-  //     enterLightSleep(min(timeUntilNextRead - 500, (unsigned long)10000));
-  //   }
-  // }
-
-  delay(100); // Small delay to prevent CPU hogging when awake
+  // When display is off in ECO mode, use longer delay but check buttons periodically
+  // Light sleep removed due to ESP32-S3 reliability issues
+  // Power is still saved via: CPU 80MHz (~35mA), ST7789 sleep (~6mA), SCD41 single shot (~14mA)
+  if (!displayOn && currentDisplayMode == MODE_ECO) {
+    // Check for button press every 100ms during the 1-second delay
+    for (int i = 0; i < 10; i++) {
+      delay(100);
+      // Quick button check - if any button pressed, break out and handle it
+      if (digitalRead(BUTTON_D0) == LOW ||
+          digitalRead(BUTTON_D1) == HIGH ||
+          digitalRead(BUTTON_D2) == HIGH) {
+        break;
+      }
+    }
+  } else {
+    delay(100);   // Normal 100ms delay
+  }
 }
 
 // =============================================================================
@@ -515,56 +530,88 @@ void initSensor() {
 // =============================================================================
 
 void readSensor() {
-  bool dataReady = false;
-  uint16_t error = scd4x.getDataReadyFlag(dataReady);
+  uint16_t co2 = 0;
+  float temp = 0.0f;
+  float humidity = 0.0f;
+  uint16_t error;
 
-  if (error) {
-    Serial.println("Error checking data ready status");
-    return;
-  }
+  if (sensorSingleShotMode) {
+    // Single shot mode: trigger measurement and wait for result
+    // Wake sensor from power down if needed
+    scd4x.wakeUp();
+    delay(30);  // Wait for sensor to wake
 
-  if (dataReady) {
-    uint16_t co2 = 0;
-    float temp = 0.0f;
-    float humidity = 0.0f;
+    // Trigger single shot measurement
+    error = scd4x.measureSingleShot();
+    if (error) {
+      Serial.println("Error triggering single shot measurement");
+      return;
+    }
+
+    // Wait for measurement to complete (5 seconds typical)
+    delay(5000);
+
+    // Read the measurement
+    error = scd4x.readMeasurement(co2, temp, humidity);
+    if (error) {
+      Serial.println("Error reading single shot measurement");
+      return;
+    }
+
+    // Put sensor back to sleep to save power
+    scd4x.powerDown();
+
+  } else {
+    // Periodic mode: check if data is ready
+    bool dataReady = false;
+    error = scd4x.getDataReadyFlag(dataReady);
+
+    if (error) {
+      Serial.println("Error checking data ready status");
+      return;
+    }
+
+    if (!dataReady) {
+      return;  // No data available yet
+    }
 
     error = scd4x.readMeasurement(co2, temp, humidity);
     if (error) {
       Serial.println("Error reading measurement");
       return;
     }
+  }
 
-    // Only update if we got valid data (CO2 = 0 means invalid)
-    if (co2 > 0) {
-      // Store raw readings
-      rawCO2 = co2;
-      rawTemperature = temp;
-      rawHumidity = humidity;
+  // Only update if we got valid data (CO2 = 0 means invalid)
+  if (co2 > 0) {
+    // Store raw readings
+    rawCO2 = co2;
+    rawTemperature = temp;
+    rawHumidity = humidity;
 
-      // Apply EMA filter
-      if (!emaInitialized) {
-        // First valid reading: initialize filtered values directly
-        currentCO2 = co2;
-        currentTemperature = temp;
-        currentHumidity = humidity;
-        emaInitialized = true;
-        Serial.println("EMA filter initialized with first reading");
-      } else {
-        // Apply exponential moving average filter
-        // Formula: filtered = alpha * new + (1 - alpha) * filtered
-        currentCO2 = (uint16_t)(EMA_ALPHA_CO2 * co2 + (1.0 - EMA_ALPHA_CO2) * currentCO2);
-        currentTemperature = EMA_ALPHA_TEMPERATURE * temp + (1.0 - EMA_ALPHA_TEMPERATURE) * currentTemperature;
-        currentHumidity = EMA_ALPHA_HUMIDITY * humidity + (1.0 - EMA_ALPHA_HUMIDITY) * currentHumidity;
-      }
-
-      // Update trends (based on filtered values)
-      updateTrends();
-
-      Serial.printf("Raw:      CO2=%d ppm, Temp=%.1f C, Humidity=%.1f %%\n",
-                    rawCO2, rawTemperature, rawHumidity);
-      Serial.printf("Filtered: CO2=%d ppm, Temp=%.1f C, Humidity=%.1f %%\n",
-                    currentCO2, currentTemperature, currentHumidity);
+    // Apply EMA filter
+    if (!emaInitialized) {
+      // First valid reading: initialize filtered values directly
+      currentCO2 = co2;
+      currentTemperature = temp;
+      currentHumidity = humidity;
+      emaInitialized = true;
+      Serial.println("EMA filter initialized with first reading");
+    } else {
+      // Apply exponential moving average filter
+      // Formula: filtered = alpha * new + (1 - alpha) * filtered
+      currentCO2 = (uint16_t)(EMA_ALPHA_CO2 * co2 + (1.0 - EMA_ALPHA_CO2) * currentCO2);
+      currentTemperature = EMA_ALPHA_TEMPERATURE * temp + (1.0 - EMA_ALPHA_TEMPERATURE) * currentTemperature;
+      currentHumidity = EMA_ALPHA_HUMIDITY * humidity + (1.0 - EMA_ALPHA_HUMIDITY) * currentHumidity;
     }
+
+    // Update trends (based on filtered values)
+    updateTrends();
+
+    Serial.printf("Raw:      CO2=%d ppm, Temp=%.1f C, Humidity=%.1f %%\n",
+                  rawCO2, rawTemperature, rawHumidity);
+    Serial.printf("Filtered: CO2=%d ppm, Temp=%.1f C, Humidity=%.1f %%\n",
+                  currentCO2, currentTemperature, currentHumidity);
   }
 }
 
@@ -1209,22 +1256,22 @@ void drawStatusBar() {
         tft.fillCircle(startX + 6, iconCenterY - 1, 3, COLOR_BLACK);  // Cut out crescent
         break;
       case MODE_ECO:
-        // Leaf icon - simple oval leaf with stem
-        // Leaf body (tilted ellipse using two triangles)
-        tft.fillTriangle(
-          startX + 2, iconCenterY + 2,   // Bottom left
-          startX + 5, iconCenterY - 4,   // Top tip
-          startX + 8, iconCenterY,       // Right side
-          modeColor
-        );
-        tft.fillTriangle(
-          startX + 2, iconCenterY + 2,   // Bottom left
-          startX + 8, iconCenterY,       // Right side
-          startX + 5, iconCenterY + 3,   // Bottom curve
-          modeColor
-        );
-        // Stem
-        tft.drawLine(startX + 2, iconCenterY + 2, startX + 1, iconCenterY + 5, modeColor);
+        // Simple 4-pointed star (celestial theme: sun → moon → star)
+        {
+          int cx = startX + 5;
+          int cy = iconCenterY;
+          // Vertical line with pointed ends
+          tft.drawFastVLine(cx, cy - 5, 11, modeColor);
+          // Horizontal line with pointed ends
+          tft.drawFastHLine(cx - 5, cy, 11, modeColor);
+          // Center dot for emphasis
+          tft.fillRect(cx - 1, cy - 1, 3, 3, modeColor);
+          // Diagonal accents
+          tft.drawPixel(cx - 2, cy - 2, modeColor);
+          tft.drawPixel(cx + 2, cy - 2, modeColor);
+          tft.drawPixel(cx - 2, cy + 2, modeColor);
+          tft.drawPixel(cx + 2, cy + 2, modeColor);
+        }
         break;
       default:
         break;
@@ -1394,16 +1441,24 @@ void handleButtons() {
       lastButtonPress[2] = currentMillis;
       button2Handled = true;
 
+      DisplayMode previousMode = currentDisplayMode;
       currentDisplayMode = (DisplayMode)((currentDisplayMode + 1) % DISPLAY_MODE_COUNT);
       lastDisplayActivity = currentMillis;
       forceDisplayRefresh = true;
       Serial.printf("Display mode: %s\n", getDisplayModeName(currentDisplayMode));
 
-      // Set brightness based on new mode (only for BRIGHT and DIM)
+      // Set brightness based on new mode
       if (currentDisplayMode == MODE_DAY) {
         setDisplayBrightness(BRIGHTNESS_HIGH);
       } else if (currentDisplayMode == MODE_NIGHT) {
         setDisplayBrightness(BRIGHTNESS_DIM);
+      }
+
+      // Switch sensor mode when entering/exiting ECO mode
+      if (currentDisplayMode == MODE_ECO && previousMode != MODE_ECO) {
+        setSensorMode(true);  // Enter single shot mode
+      } else if (currentDisplayMode != MODE_ECO && previousMode == MODE_ECO) {
+        setSensorMode(false); // Return to periodic mode
       }
 
       // Ensure display is on when changing modes
@@ -1426,13 +1481,17 @@ void setDisplayPower(bool on) {
   displayOn = on;
 
   if (on) {
+    // Wake ST7789 from sleep mode first
+    tft.enableSleep(false);
+    delay(120);  // ST7789 requires 120ms after sleep out
+
     // Clear screen and set brightness based on mode
     tft.fillScreen(COLOR_BLACK);
     int brightness;
     if (currentDisplayMode == MODE_NIGHT) {
       brightness = BRIGHTNESS_DIM;
     } else if (currentDisplayMode == MODE_ECO) {
-      brightness = BRIGHTNESS_DIM;  // Use dim brightness when waking in Power Save
+      brightness = BRIGHTNESS_DIM;  // Use dim brightness when waking in ECO
     } else {
       brightness = BRIGHTNESS_HIGH;
     }
@@ -1440,7 +1499,9 @@ void setDisplayPower(bool on) {
     lastDisplayActivity = millis();  // Reset timeout when display turns on
     forceDisplayRefresh = true;
   } else {
+    // Turn off backlight first, then put ST7789 to sleep
     analogWrite(TFT_BACKLITE, 0);
+    tft.enableSleep(true);  // Reduces ST7789 from 6mA to 30µA
   }
 
   // IMPORTANT: Reset button debounce timers after display state change
@@ -1524,6 +1585,41 @@ void initPowerSaving() {
   Serial.println("Power saving initialized");
 }
 
+void setSensorMode(bool singleShot) {
+  if (singleShot == sensorSingleShotMode) return;
+
+  uint16_t error;
+
+  if (singleShot) {
+    // Switch to single shot mode: stop periodic measurement
+    error = scd4x.stopPeriodicMeasurement();
+    if (error) {
+      Serial.println("Error stopping periodic measurement");
+      return;
+    }
+    delay(500);  // Wait for sensor to stop
+
+    // Put sensor to sleep until next measurement
+    scd4x.powerDown();
+
+    sensorSingleShotMode = true;
+    Serial.println("Sensor: Single shot mode (low power)");
+  } else {
+    // Switch to periodic mode: wake sensor and start periodic measurement
+    scd4x.wakeUp();
+    delay(30);
+
+    error = scd4x.startPeriodicMeasurement();
+    if (error) {
+      Serial.println("Error starting periodic measurement");
+      return;
+    }
+
+    sensorSingleShotMode = false;
+    Serial.println("Sensor: Periodic measurement mode");
+  }
+}
+
 void updateHyperdrive() {
   // Calculate CO2 change since last hyperdrive check
   int co2Change = abs((int)currentCO2 - (int)lastHyperdriveCO2);
@@ -1576,13 +1672,18 @@ void enterLightSleep(unsigned long duration_ms) {
   esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
 
   if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) {
-    Serial.println("Woke up from button press");
-    unsigned long now = millis();
-    lastDisplayActivity = now;
-    lastButtonPress[0] = now;
-    // Turn on display immediately when waking from button press
-    if (!displayOn) {
-      setDisplayPower(true);
+    // Verify button is actually pressed (filter out GPIO noise)
+    delay(50);  // Debounce delay
+    if (digitalRead(BUTTON_D0) == LOW) {
+      Serial.println("Woke up from button press");
+      unsigned long now = millis();
+      lastDisplayActivity = now;
+      lastButtonPress[0] = now;
+      if (!displayOn) {
+        setDisplayPower(true);
+      }
+    } else {
+      Serial.println("Woke up from EXT0 noise (ignored)");
     }
   } else if (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) {
     Serial.println("Woke up from timer");
