@@ -24,13 +24,15 @@
 #include <Adafruit_ST7789.h>
 #include <SensirionI2CScd4x.h>
 #include <Adafruit_MAX1704X.h>
+#include <esp_sleep.h>
+#include <driver/rtc_io.h>
 
 // =============================================================================
 // CONFIGURATION - Adjust these values to customize behavior
 // =============================================================================
 
 // Firmware Version
-#define VERSION                 "0.9"
+#define VERSION                 "1.0"
 
 // CO2 Thresholds (in ppm)
 #define CO2_COLOR_LOW           COLOR_GREEN   // Excellent
@@ -81,6 +83,12 @@
 #define BRIGHTNESS_NIGHT           80     // Night mode brightness
 #define BRIGHTNESS_ECO             30     // ECO mode brightness (minimal)
 
+// Deep Sleep Configuration
+#define DEEP_SLEEP_US              300000000ULL  // 5 minutes in microseconds
+#define RTC_DATA_MAGIC             0xC02CAFE     // Magic number for RTC data validation
+#define CPU_FREQ_ACTIVE            160           // MHz when display is on
+#define CPU_FREQ_SENSOR            80            // MHz for sensor-only wakes
+
 // EMA Filter Configuration (alpha: 0=max smoothing, 1=no smoothing)
 #define EMA_ALPHA_CO2              0.5    // CO2 changes slowly, moderate smoothing
 #define EMA_ALPHA_TEMPERATURE      0.5    // Temperature is stable, more smoothing
@@ -92,7 +100,7 @@
 #define TREND_THRESHOLD_HUMIDITY   2.0    // % change for humidity trend
 
 // SCD41 Sensor Configuration
-#define SCD41_TEMPERATURE_OFFSET   3.5    // Temperature offset in °C (positive values only, subtracted from reading)
+#define SCD41_TEMPERATURE_OFFSET   1.5    // Temperature offset in °C (positive values only, subtracted from reading)
 #define SCD41_ALTITUDE             525    // Altitude in meters (0 = sea level, set for your location)
 
 // Graph Configuration
@@ -140,7 +148,6 @@ enum DisplayValue {
 
 enum ViewMode {
   VIEW_NUMBER,
-  VIEW_DASHBOARD,
   VIEW_GRAPH,
   VIEW_MODE_COUNT
 };
@@ -153,73 +160,103 @@ enum DisplayMode {
 };
 
 // =============================================================================
-// GLOBAL OBJECTS
+// RTC PERSISTENT STATE (survives deep sleep)
 // =============================================================================
 
-// TFT_CS, TFT_DC, TFT_RST are defined by the ESP32-S3 Reverse TFT board package
+struct RtcState {
+  uint32_t magic;
+
+  // Sensor readings (raw)
+  uint16_t rawCO2;
+  float rawTemperature;
+  float rawHumidity;
+
+  // Filtered readings (EMA smoothed)
+  uint16_t currentCO2;
+  float currentTemperature;
+  float currentHumidity;
+  bool emaInitialized;
+
+  // Graph history (circular buffer)
+  uint16_t historyCO2[GRAPH_POINTS];
+  float historyTemperature[GRAPH_POINTS];
+  float historyHumidity[GRAPH_POINTS];
+  int historyIndex;
+  int historyCount;
+
+  // UI state
+  DisplayValue currentDisplayValue;
+  ViewMode currentViewMode;
+  DisplayMode currentDisplayMode;
+
+  // Trend tracking
+  uint16_t trendCO2;
+  float trendTemperature;
+  float trendHumidity;
+  int8_t co2Trend;
+  int8_t tempTrend;
+  int8_t humidTrend;
+
+  // Hyperdrive state
+  bool hyperdriveActive;
+  uint16_t lastHyperdriveCO2;
+  int hyperdriveStableCount;
+};
+
+RTC_DATA_ATTR RtcState rtc;
+
+// Aliases so existing code compiles without renaming every reference
+#define rawCO2              rtc.rawCO2
+#define rawTemperature      rtc.rawTemperature
+#define rawHumidity         rtc.rawHumidity
+#define currentCO2          rtc.currentCO2
+#define currentTemperature  rtc.currentTemperature
+#define currentHumidity     rtc.currentHumidity
+#define emaInitialized      rtc.emaInitialized
+#define historyCO2          rtc.historyCO2
+#define historyTemperature  rtc.historyTemperature
+#define historyHumidity     rtc.historyHumidity
+#define historyIndex        rtc.historyIndex
+#define historyCount        rtc.historyCount
+#define currentDisplayValue rtc.currentDisplayValue
+#define currentViewMode     rtc.currentViewMode
+#define currentDisplayMode  rtc.currentDisplayMode
+#define trendCO2            rtc.trendCO2
+#define trendTemperature    rtc.trendTemperature
+#define trendHumidity       rtc.trendHumidity
+#define co2Trend            rtc.co2Trend
+#define tempTrend           rtc.tempTrend
+#define humidTrend          rtc.humidTrend
+#define hyperdriveActive    rtc.hyperdriveActive
+#define lastHyperdriveCO2   rtc.lastHyperdriveCO2
+#define hyperdriveStableCount rtc.hyperdriveStableCount
+
+// =============================================================================
+// GLOBAL STATE (re-initialized each wake cycle, not persisted)
+// =============================================================================
+
+// Hardware objects
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 SensirionI2CScd4x scd4x;
 Adafruit_MAX17048 batteryMonitor;
 bool batteryMonitorAvailable = false;
 
-// =============================================================================
-// GLOBAL STATE
-// =============================================================================
-
-// Current readings (raw from sensor)
-uint16_t rawCO2 = 0;
-float rawTemperature = 0.0;
-float rawHumidity = 0.0;
-
-// Filtered readings (EMA smoothed) - these are used for display
-uint16_t currentCO2 = 0;
-float currentTemperature = 0.0;
-float currentHumidity = 0.0;
-bool emaInitialized = false;  // First reading initializes EMA, subsequent readings are filtered
-
-// Graph history (circular buffer)
-uint16_t historyCO2[GRAPH_POINTS] = {0};
-float historyTemperature[GRAPH_POINTS] = {0};
-float historyHumidity[GRAPH_POINTS] = {0};
-int historyIndex = 0;
-int historyCount = 0;
-
-// UI State
-DisplayValue currentDisplayValue = DISPLAY_CO2;
-ViewMode currentViewMode = VIEW_NUMBER;
-DisplayMode currentDisplayMode = MODE_DAY;
+// Wake-cycle state
 bool displayOn = true;
-
-// Timing
+bool sensorSingleShotMode = false;
+bool forceDisplayRefresh = true;
 unsigned long lastSensorRead = 0;
 unsigned long lastGraphSample = 0;
 unsigned long lastDisplayActivity = 0;
 unsigned long lastButtonPress[3] = {0, 0, 0};
-bool forceDisplayRefresh = true;  // Force refresh on startup and mode changes
 
-// Hyperdrive state
-bool hyperdriveActive = true;      // Start in hyperdrive for quick initial readings
-uint16_t lastHyperdriveCO2 = 0;    // CO2 reading used for hyperdrive comparison
-int hyperdriveStableCount = 0;     // Count of consecutive stable readings
-
-// Sensor power mode
-bool sensorSingleShotMode = false; // True when using single shot instead of periodic
-
-// Previous values for display update optimization
+// Previous values for display update optimization (reset each wake)
 uint16_t prevCO2 = 0;
 float prevTemperature = 0.0;
 float prevHumidity = 0.0;
 DisplayValue prevDisplayValue = DISPLAY_CO2;
 ViewMode prevViewMode = VIEW_NUMBER;
 DisplayMode prevDisplayMode = MODE_DAY;
-
-// Trend tracking (for arrow indicators)
-uint16_t trendCO2 = 0;
-float trendTemperature = 0.0;
-float trendHumidity = 0.0;
-int8_t co2Trend = 0;      // -1 = down, 0 = stable, 1 = up
-int8_t tempTrend = 0;
-int8_t humidTrend = 0;
 
 // =============================================================================
 // FUNCTION DECLARATIONS
@@ -231,14 +268,10 @@ void readSensor();
 void updateHistory();
 void updateDisplay();
 void drawNumberView();
-void drawDashboardView();
 void drawGraphView();
 void drawSmallValues();
 void drawGraph();
 void drawStatusBar();
-uint16_t getContrastColor(uint16_t bgColor);
-void drawTile(int x, int y, int w, int h, const char* label, const char* value,
-              int8_t trend, uint16_t bgColor, int cornerRadius);
 uint16_t getCO2Color(uint16_t co2);
 uint16_t getTemperatureColor(float temp);
 uint16_t getHumidityColor(float humidity);
@@ -255,17 +288,27 @@ int getBatteryPercent();
 void initPowerSaving();
 void updateHyperdrive();
 void setSensorMode(bool singleShot);
+void enterDeepSleep();
+void initDisplayWarm();
 
 // =============================================================================
 // SETUP
 // =============================================================================
 
 void setup() {
-  setCpuFrequencyMhz(160);
+  esp_sleep_wakeup_cause_t wakeReason = esp_sleep_get_wakeup_cause();
+  bool warmBoot = (rtc.magic == RTC_DATA_MAGIC);
+  bool buttonWake = (wakeReason == ESP_SLEEP_WAKEUP_EXT1);
+
+  // CPU: 80 MHz for sensor-only wakes, 160 MHz when display is needed
+  setCpuFrequencyMhz((warmBoot && !buttonWake) ? CPU_FREQ_SENSOR : CPU_FREQ_ACTIVE);
+
+  // Release GPIO hold from previous deep sleep
+  gpio_hold_dis((gpio_num_t)TFT_I2C_POWER);
+  gpio_deep_sleep_hold_dis();
 
   Serial.begin(115200);
-  delay(1000);
-  Serial.printf("ESP32-S3 CO2 Monitor v%s Starting... (CPU: %d MHz)\n", VERSION, getCpuFrequencyMhz());
+  delay(warmBoot ? 100 : 1000);
 
   // Initialize power saving (disable WiFi, Bluetooth, unused GPIOs)
   initPowerSaving();
@@ -275,32 +318,84 @@ void setup() {
   pinMode(BUTTON_D1, INPUT_PULLDOWN);
   pinMode(BUTTON_D2, INPUT_PULLDOWN);
 
-  // Initialize display
-  initDisplay();
+  // Ensure I2C power is on
+  pinMode(TFT_I2C_POWER, OUTPUT);
+  digitalWrite(TFT_I2C_POWER, HIGH);
+  delay(10);
 
-  // Initialize sensor
-  initSensor();
+  if (!warmBoot) {
+    // ==================== COLD BOOT ====================
+    Serial.printf("ESP32-S3 CO2 Monitor v%s Cold Start (CPU: %d MHz)\n",
+                  VERSION, getCpuFrequencyMhz());
 
-  // Initialize battery monitor (MAX17048)
-  if (batteryMonitor.begin()) {
-    batteryMonitorAvailable = true;
-    Serial.println("MAX17048 battery monitor initialized");
+    // Zero out RTC state
+    memset(&rtc, 0, sizeof(rtc));
+    currentDisplayMode = MODE_DAY;
+    currentDisplayValue = DISPLAY_CO2;
+    currentViewMode = VIEW_NUMBER;
+    hyperdriveActive = true;
+
+    // Initialize display (full init with splash screen)
+    initDisplay();
+
+    // Initialize sensor (full config)
+    initSensor();
+
+    // Initialize battery monitor
+    if (batteryMonitor.begin()) {
+      batteryMonitorAvailable = true;
+      Serial.println("MAX17048 battery monitor initialized");
+    } else {
+      Serial.println("MAX17048 not found, battery display disabled");
+    }
+
+    // Wait for first valid sensor reading
+    Serial.println("Waiting for first sensor reading...");
+    while (currentCO2 == 0) {
+      readSensor();
+      delay(500);
+    }
+    updateHistory();
+    lastHyperdriveCO2 = currentCO2;
+    rtc.magic = RTC_DATA_MAGIC;
+
+    Serial.println("Cold boot setup complete!");
+    forceDisplayRefresh = true;
+
   } else {
-    batteryMonitorAvailable = false;
-    Serial.println("MAX17048 not found, battery display disabled");
-  }
+    // ==================== WARM BOOT (from deep sleep) ====================
+    Serial.printf("ESP32-S3 CO2 Monitor v%s Warm Boot (%s, CPU: %d MHz)\n",
+                  VERSION, buttonWake ? "button" : "timer", getCpuFrequencyMhz());
 
-  // Initial sensor read to display values immediately
-  Serial.println("Waiting for first sensor reading...");
-  while (currentCO2 == 0) {
+    // Re-initialize I2C bus and sensor (bus state lost during deep sleep)
+    sensorSingleShotMode = true;  // Always in ECO mode during deep sleep
+    Wire.begin();
+    scd4x.begin(Wire);
+
+    // Re-initialize battery monitor
+    if (batteryMonitor.begin()) {
+      batteryMonitorAvailable = true;
+    }
+
+    // Read sensor (single-shot)
     readSensor();
-    delay(500);
-  }
-  updateHistory();  // Store first data point
-  lastHyperdriveCO2 = currentCO2;  // Initialize hyperdrive baseline
+    updateHistory();
 
-  Serial.println("Setup complete!");
-  forceDisplayRefresh = true;
+    if (buttonWake) {
+      // Button wake: turn on display, enter active loop
+      setCpuFrequencyMhz(CPU_FREQ_ACTIVE);
+      initDisplayWarm();
+      displayOn = true;
+      lastDisplayActivity = millis();
+      forceDisplayRefresh = true;
+      Serial.println("Display activated by button press");
+    } else {
+      // Timer wake: sensor read done, go back to sleep immediately
+      Serial.println("Timer wake: sensor read complete, returning to sleep");
+      enterDeepSleep();
+      // Never reached
+    }
+  }
 }
 
 // =============================================================================
@@ -308,36 +403,38 @@ void setup() {
 // =============================================================================
 
 void loop() {
-  unsigned long currentMillis = millis();
-
   // Handle button input
   handleButtons();
 
-  // Determine current sensor read interval (normal or hyperdrive)
-  unsigned long currentInterval = hyperdriveActive ? SENSOR_READ_INTERVAL_FAST : SENSOR_READ_INTERVAL;
-
-  // Read sensor at regular intervals
-  if (currentMillis - lastSensorRead >= currentInterval) {
-    readSensor();
-    lastSensorRead = currentMillis;
-    forceDisplayRefresh = true;  // Refresh display when new data arrives
-
-    // Update hyperdrive state (only if not in ECO mode)
-    if (currentDisplayMode != MODE_ECO) {
-      updateHyperdrive();
-    } else if (hyperdriveActive) {
-      // Disable hyperdrive in ECO mode
-      hyperdriveActive = false;
-      hyperdriveStableCount = 0;
-      Serial.println("Hyperdrive disabled (ECO mode)");
+  // ECO mode: display timeout -> deep sleep
+  if (currentDisplayMode == MODE_ECO && displayOn) {
+    if (millis() - lastDisplayActivity >= DISPLAY_TIMEOUT) {
+      Serial.println("ECO display timeout, entering deep sleep");
+      setDisplayPower(false);
+      enterDeepSleep();
+      // Never reached
     }
-
   }
 
-  // Update history for graph at regular intervals
-  if (currentMillis - lastGraphSample >= GRAPH_SAMPLE_INTERVAL) {
-    updateHistory();
-    lastGraphSample = currentMillis;
+  // Sensor reads (DAY/NIGHT only - ECO reads happen in setup() on wake)
+  if (currentDisplayMode != MODE_ECO) {
+    unsigned long currentInterval = hyperdriveActive ?
+      SENSOR_READ_INTERVAL_FAST : SENSOR_READ_INTERVAL;
+
+    if (millis() - lastSensorRead >= currentInterval) {
+      readSensor();
+      lastSensorRead = millis();
+      forceDisplayRefresh = true;
+      updateHyperdrive();
+    }
+  }
+
+  // History update (DAY/NIGHT only - ECO updates in setup() on wake)
+  if (currentDisplayMode != MODE_ECO) {
+    if (millis() - lastGraphSample >= GRAPH_SAMPLE_INTERVAL) {
+      updateHistory();
+      lastGraphSample = millis();
+    }
   }
 
   // Update display (smart refresh - only redraws when values change)
@@ -346,7 +443,6 @@ void loop() {
     forceDisplayRefresh = false;
   }
 
-  // Normal delay when not in deep sleep mode
   delay(100);
 }
 
@@ -653,9 +749,6 @@ void updateDisplay() {
     case VIEW_NUMBER:
       drawNumberView();
       break;
-    case VIEW_DASHBOARD:
-      drawDashboardView();
-      break;
     case VIEW_GRAPH:
       drawGraphView();
       break;
@@ -842,162 +935,6 @@ void drawSmallValues() {
   int rightLabelWidth = strlen(rightLabel) * 6;
   tft.setCursor(rightMargin - rightLabelWidth, yPos + 18);
   tft.print(rightLabel);
-}
-
-// =============================================================================
-// DASHBOARD VIEW
-// =============================================================================
-
-uint16_t getContrastColor(uint16_t bgColor) {
-  // Extract RGB565 components
-  uint8_t r5 = (bgColor >> 11) & 0x1F;  // 0-31
-  uint8_t g6 = (bgColor >> 5) & 0x3F;   // 0-63
-  uint8_t b5 = bgColor & 0x1F;          // 0-31
-
-  // Convert to approximate 8-bit values
-  uint8_t r = (r5 << 3);
-  uint8_t g = (g6 << 2);
-  uint8_t b = (b5 << 3);
-
-  // Calculate perceived luminance (ITU-R BT.601)
-  int luminance = (r * 299 + g * 587 + b * 114) / 1000;
-
-  return (luminance > 140) ? COLOR_BLACK : COLOR_WHITE;
-}
-
-void drawTile(int x, int y, int w, int h, const char* label, const char* value,
-              int8_t trend, uint16_t outlineColor, int cornerRadius) {
-  // Draw rounded rectangle outline (2px thick for visibility)
-  tft.drawRoundRect(x, y, w, h, cornerRadius, outlineColor);
-  tft.drawRoundRect(x + 1, y + 1, w - 2, h - 2, cornerRadius - 1, outlineColor);
-
-  // Draw label - centered horizontally, upper portion, same color as outline
-  // Faux bold: draw twice with 1px horizontal offset
-  tft.setTextColor(outlineColor);
-  tft.setTextSize(2);
-  int labelWidth = strlen(label) * 12;
-  int labelX = x + (w - labelWidth) / 2;
-  int labelY = y + 8;
-  tft.setCursor(labelX, labelY);
-  tft.print(label);
-  tft.setCursor(labelX + 1, labelY);
-  tft.print(label);
-
-  // Draw value - centered, lower portion, white text
-  tft.setTextColor(COLOR_WHITE);
-  tft.setTextSize(1);
-  int valueWidth = strlen(value) * 6;
-  int valueY = y + h - 18;
-  tft.setCursor(x + (w - valueWidth) / 2, valueY);
-  tft.print(value);
-
-  // Draw small trend arrow - bottom right corner with spacing from outline
-  if (trend != 0) {
-    int arrowW = 8;
-    int arrowH = 7;
-    int arrowX = x + w - arrowW - 6;  // 6px from right edge
-    int arrowY = y + h - arrowH - 6;  // 6px from bottom edge
-
-    if (trend > 0) {
-      tft.fillTriangle(
-        arrowX + arrowW / 2, arrowY,              // Top point
-        arrowX, arrowY + arrowH,                  // Bottom left
-        arrowX + arrowW, arrowY + arrowH,         // Bottom right
-        outlineColor
-      );
-    } else {
-      tft.fillTriangle(
-        arrowX + arrowW / 2, arrowY + arrowH,     // Bottom point
-        arrowX, arrowY,                           // Top left
-        arrowX + arrowW, arrowY,                  // Top right
-        outlineColor
-      );
-    }
-  }
-}
-
-void drawDashboardView() {
-  // Clear display area (below status bar)
-  tft.fillRect(0, 18, 240, 117, COLOR_BLACK);
-
-  // Tile layout: 2x2 grid
-  // Available area: 240x117 (y: 18-135)
-  int margin = 5;
-  int tileW = (240 - margin * 3) / 2;   // ~113px
-  int tileH = (117 - margin * 3) / 2;   // ~52px
-  int cornerRadius = 5;
-  int startY = 18 + margin;
-
-  char valueStr[16];
-
-  // Tile data for all metrics
-  struct TileData {
-    const char* label;
-    char value[16];
-    int8_t trend;
-    uint16_t color;
-  };
-
-  TileData tiles[3];
-
-  // CO2
-  tiles[0].label = "CO2";
-  snprintf(tiles[0].value, sizeof(tiles[0].value), "%d ppm", currentCO2);
-  tiles[0].trend = co2Trend;
-  tiles[0].color = getCO2Color(currentCO2);
-
-  // Temperature
-  tiles[1].label = "Temp";
-  snprintf(tiles[1].value, sizeof(tiles[1].value), "%.1f C", currentTemperature);
-  tiles[1].trend = tempTrend;
-  tiles[1].color = getTemperatureColor(currentTemperature);
-
-  // Humidity
-  tiles[2].label = "Humid";
-  snprintf(tiles[2].value, sizeof(tiles[2].value), "%.0f %%", currentHumidity);
-  tiles[2].trend = humidTrend;
-  tiles[2].color = getHumidityColor(currentHumidity);
-
-  // Reorder tiles based on currentDisplayValue (selected metric first)
-  int order[3];
-  order[0] = (int)currentDisplayValue;
-  order[1] = (currentDisplayValue + 1) % 3;
-  order[2] = (currentDisplayValue + 2) % 3;
-
-  // Draw tiles in order: selected first (top-left), then others
-  // Top-left
-  drawTile(margin, startY, tileW, tileH,
-           tiles[order[0]].label, tiles[order[0]].value,
-           tiles[order[0]].trend, tiles[order[0]].color, cornerRadius);
-
-  // Top-right
-  drawTile(margin * 2 + tileW, startY, tileW, tileH,
-           tiles[order[1]].label, tiles[order[1]].value,
-           tiles[order[1]].trend, tiles[order[1]].color, cornerRadius);
-
-  // Bottom-left
-  drawTile(margin, startY + tileH + margin, tileW, tileH,
-           tiles[order[2]].label, tiles[order[2]].value,
-           tiles[order[2]].trend, tiles[order[2]].color, cornerRadius);
-
-  // Bottom-right: Battery
-  int batteryPercent = getBatteryPercent();
-  uint16_t batteryColor;
-  if (batteryPercent < 0) {
-    snprintf(valueStr, sizeof(valueStr), "USB");
-    batteryColor = COLOR_DARK_GRAY;
-  } else if (batteryPercent < 20) {
-    snprintf(valueStr, sizeof(valueStr), "%d %%", batteryPercent);
-    batteryColor = COLOR_RED;
-  } else if (batteryPercent < 50) {
-    snprintf(valueStr, sizeof(valueStr), "%d %%", batteryPercent);
-    batteryColor = COLOR_ORANGE;
-  } else {
-    snprintf(valueStr, sizeof(valueStr), "%d %%", batteryPercent);
-    batteryColor = COLOR_GREEN;
-  }
-  drawTile(margin * 2 + tileW, startY + tileH + margin, tileW, tileH,
-           "Batt", valueStr, 0, batteryColor, cornerRadius);
 }
 
 void drawGraphView() {
@@ -1342,21 +1279,37 @@ uint16_t getHumidityColor(float humidity) {
 // =============================================================================
 
 void handleButtons() {
-  unsigned long currentMillis = millis();
+  unsigned long now = millis();
 
   // Static flags to track if button action was already handled (require release before next action)
   static bool button0Handled = false;
   static bool button1Handled = false;
   static bool button2Handled = false;
 
-  // Button D0 - Cycle through display values (CO2 -> Temp -> Humidity)
   bool button0Pressed = (digitalRead(BUTTON_D0) == LOW);
+  bool button1Pressed = (digitalRead(BUTTON_D1) == HIGH);
+  bool button2Pressed = (digitalRead(BUTTON_D2) == HIGH);
+
+  // ECO mode with display off: ANY button press wakes display (first press only wakes)
+  if (currentDisplayMode == MODE_ECO && !displayOn) {
+    if (button0Pressed || button1Pressed || button2Pressed) {
+      lastDisplayActivity = now;
+      setDisplayPower(true);
+      button0Handled = true;
+      button1Handled = true;
+      button2Handled = true;
+      Serial.println("ECO: Display woken by button");
+      return;
+    }
+  }
+
+  // Button D0 - Cycle through display values (CO2 -> Temp -> Humidity)
   if (button0Pressed) {
-    if (!button0Handled && (currentMillis - lastButtonPress[0] >= DEBOUNCE_DELAY)) {
-      lastButtonPress[0] = currentMillis;
+    if (!button0Handled && (now - lastButtonPress[0] >= DEBOUNCE_DELAY)) {
+      lastButtonPress[0] = now;
       button0Handled = true;
       currentDisplayValue = (DisplayValue)((currentDisplayValue + 1) % DISPLAY_VALUE_COUNT);
-      lastDisplayActivity = currentMillis;
+      lastDisplayActivity = now;
       forceDisplayRefresh = true;
       Serial.printf("Display value: %s\n", getDisplayValueName(currentDisplayValue));
     }
@@ -1365,38 +1318,29 @@ void handleButtons() {
   }
 
   // Button D1 - Toggle between number and graph view
-  bool button1Pressed = (digitalRead(BUTTON_D1) == HIGH);
   if (button1Pressed) {
-    if (!button1Handled && (currentMillis - lastButtonPress[1] >= DEBOUNCE_DELAY)) {
-      lastButtonPress[1] = currentMillis;
+    if (!button1Handled && (now - lastButtonPress[1] >= DEBOUNCE_DELAY)) {
+      lastButtonPress[1] = now;
       button1Handled = true;
-
-      if (currentDisplayMode == MODE_ECO && !displayOn) {
-        lastDisplayActivity = currentMillis;
-        setDisplayPower(true);
-        Serial.println("Button D1: Wake display");
-      } else {
-        currentViewMode = (ViewMode)((currentViewMode + 1) % VIEW_MODE_COUNT);
-        lastDisplayActivity = currentMillis;
-        forceDisplayRefresh = true;
-        const char* viewNames[] = {"Number", "Dashboard", "Graph"};
-        Serial.printf("View mode: %s\n", viewNames[currentViewMode]);
-      }
+      currentViewMode = (ViewMode)((currentViewMode + 1) % VIEW_MODE_COUNT);
+      lastDisplayActivity = now;
+      forceDisplayRefresh = true;
+      const char* viewNames[] = {"Number", "Graph"};
+      Serial.printf("View mode: %s\n", viewNames[currentViewMode]);
     }
   } else {
     button1Handled = false;
   }
 
-  // Button D2 - Cycle through display modes (Bright -> Dim -> Power Save)
-  bool button2Pressed = (digitalRead(BUTTON_D2) == HIGH);
+  // Button D2 - Cycle through display modes (Day -> Night -> ECO)
   if (button2Pressed) {
-    if (!button2Handled && (currentMillis - lastButtonPress[2] >= DEBOUNCE_DELAY)) {
-      lastButtonPress[2] = currentMillis;
+    if (!button2Handled && (now - lastButtonPress[2] >= DEBOUNCE_DELAY)) {
+      lastButtonPress[2] = now;
       button2Handled = true;
 
       DisplayMode previousMode = currentDisplayMode;
       currentDisplayMode = (DisplayMode)((currentDisplayMode + 1) % DISPLAY_MODE_COUNT);
-      lastDisplayActivity = currentMillis;
+      lastDisplayActivity = now;
       forceDisplayRefresh = true;
       Serial.printf("Display mode: %s\n", getDisplayModeName(currentDisplayMode));
 
@@ -1513,13 +1457,14 @@ void initPowerSaving() {
   // Configure unused GPIO pins to save power
   // ESP32-S3 Reverse TFT Feather pins in use:
   // - GPIO 0, 1, 2: Buttons
-  // - GPIO 8, 9: I2C (SDA, SCL) for sensor and battery monitor
-  // - GPIO 5, 6, 7, 35, 36: TFT display (CS, DC, RST, BACKLITE, I2C_POWER)
-  // - GPIO 21: NEOPIXEL (onboard)
+  // - GPIO 3, 4: I2C (SDA, SCL) for sensor and battery monitor
+  // - GPIO 7: TFT_I2C_POWER
+  // - GPIO 33: NEOPIXEL, GPIO 21: NEOPIXEL_POWER
+  // - GPIO 35, 36, 37, 40, 41, 42, 45: TFT display (MOSI, SCK, MISO, DC, RST, CS, BACKLITE)
   //
   // Unused pins should be set to INPUT with no pull resistors
   // to minimize current leakage
-  const int unusedPins[] = {3, 4, 10, 11, 12, 13, 14, 15, 16, 17, 18, 37, 38, 39, 40, 41, 42};
+  const int unusedPins[] = {10, 11, 12, 13, 14, 15, 16, 17, 18, 38, 39};
   for (int i = 0; i < sizeof(unusedPins) / sizeof(unusedPins[0]); i++) {
     gpio_reset_pin((gpio_num_t)unusedPins[i]);
     gpio_set_direction((gpio_num_t)unusedPins[i], GPIO_MODE_INPUT);
@@ -1600,4 +1545,61 @@ void updateHyperdrive() {
 
   // Update baseline for next comparison
   lastHyperdriveCO2 = currentCO2;
+}
+
+// =============================================================================
+// DEEP SLEEP FUNCTIONS
+// =============================================================================
+
+void enterDeepSleep() {
+  // Ensure display is off
+  if (displayOn) {
+    setDisplayPower(false);
+  }
+
+  // Mark RTC data as valid
+  rtc.magic = RTC_DATA_MAGIC;
+
+  // Configure wake sources
+  // Timer: 5 minutes for periodic sensor reads
+  esp_sleep_enable_timer_wakeup(DEEP_SLEEP_US);
+
+  // EXT1: GPIO 1 (D1) and GPIO 2 (D2), wake on HIGH level
+  // GPIO 0 excluded - strapping pin prone to spurious wakes from noise
+  uint64_t ext1_mask = (1ULL << BUTTON_D1) | (1ULL << BUTTON_D2);
+  esp_sleep_enable_ext1_wakeup(ext1_mask, ESP_EXT1_WAKEUP_ANY_HIGH);
+
+  // Configure RTC pull-downs for wake pins
+  // Digital pull-downs from pinMode() are lost during deep sleep — only RTC domain stays active
+  rtc_gpio_pulldown_en((gpio_num_t)BUTTON_D1);
+  rtc_gpio_pullup_dis((gpio_num_t)BUTTON_D1);
+  rtc_gpio_pulldown_en((gpio_num_t)BUTTON_D2);
+  rtc_gpio_pullup_dis((gpio_num_t)BUTTON_D2);
+
+  // Hold I2C power HIGH during sleep so sensor retains calibration state
+  gpio_hold_en((gpio_num_t)TFT_I2C_POWER);
+  gpio_deep_sleep_hold_en();
+
+  Serial.println("Entering deep sleep...");
+  Serial.flush();
+
+  esp_deep_sleep_start();
+  // Execution stops here. Next code to run is setup() after wake.
+}
+
+void initDisplayWarm() {
+  // Minimal display init after deep sleep (no splash screen)
+  // I2C power already enabled in setup()
+  pinMode(TFT_BACKLITE, OUTPUT);
+  analogWrite(TFT_BACKLITE, 0);  // Start dark
+
+  // SPI state is lost during deep sleep, must re-init
+  tft.init(135, 240);
+  tft.setRotation(3);
+  tft.fillScreen(COLOR_BLACK);
+
+  // Wake display and set ECO brightness
+  tft.enableSleep(false);
+  delay(120);  // ST7789 requires 120ms after sleep out
+  analogWrite(TFT_BACKLITE, BRIGHTNESS_ECO);
 }
