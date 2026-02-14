@@ -9,9 +9,9 @@
  *   - Real-time CO2, Temperature, and Humidity display
  *   - Color-coded thresholds (configurable)
  *   - 24-hour history graph
- *   - Multiple display modes: Bright, Dim, Power Save
+ *   - Multiple display modes: Day, Night, ECO
  *   - Hyperdrive mode: faster readings when CO2 changes rapidly
- *   - Power saving: WiFi/BT disabled, light sleep, unused GPIO management
+ *   - Power saving: WiFi/BT disabled, single-shot sensor, unused GPIO management
  */
 
 #include <Arduino.h>
@@ -19,7 +19,6 @@
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <esp_bt.h>
-#include <esp_sleep.h>
 #include <driver/gpio.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
@@ -31,7 +30,7 @@
 // =============================================================================
 
 // Firmware Version
-#define VERSION                 "0.8"
+#define VERSION                 "0.9"
 
 // CO2 Thresholds (in ppm)
 #define CO2_COLOR_LOW           COLOR_GREEN   // Excellent
@@ -78,8 +77,9 @@
 #define HYPERDRIVE_STABLE_COUNT    3      // Consecutive stable readings to exit hyperdrive
 
 // Display Brightness (PWM values 0-255)
-#define BRIGHTNESS_HIGH            255    // Full brightness
-#define BRIGHTNESS_DIM             64     // Dimmed brightness (~25%)
+#define BRIGHTNESS_DAY             200    // Day mode brightness
+#define BRIGHTNESS_NIGHT           80     // Night mode brightness
+#define BRIGHTNESS_ECO             30     // ECO mode brightness (minimal)
 
 // EMA Filter Configuration (alpha: 0=max smoothing, 1=no smoothing)
 #define EMA_ALPHA_CO2              0.5    // CO2 changes slowly, moderate smoothing
@@ -254,7 +254,6 @@ void drawTrendArrow(int x, int y, int8_t trend, uint16_t color);
 int getBatteryPercent();
 void initPowerSaving();
 void updateHyperdrive();
-void enterLightSleep(unsigned long duration_ms);
 void setSensorMode(bool singleShot);
 
 // =============================================================================
@@ -262,20 +261,17 @@ void setSensorMode(bool singleShot);
 // =============================================================================
 
 void setup() {
-  // Reduce CPU frequency from 240MHz to 80MHz to save power (~35mA savings)
-  setCpuFrequencyMhz(80);
+  setCpuFrequencyMhz(160);
 
   Serial.begin(115200);
   delay(1000);
-  Serial.printf("ESP32-S3 CO2 Monitor Starting... (CPU: %d MHz)\n", getCpuFrequencyMhz());
+  Serial.printf("ESP32-S3 CO2 Monitor v%s Starting... (CPU: %d MHz)\n", VERSION, getCpuFrequencyMhz());
 
   // Initialize power saving (disable WiFi, Bluetooth, unused GPIOs)
   initPowerSaving();
 
   // Initialize buttons
-  // D0 is pulled HIGH internally, goes LOW when pressed
   pinMode(BUTTON_D0, INPUT_PULLUP);
-  // D1 and D2 are pulled LOW internally, go HIGH when pressed
   pinMode(BUTTON_D1, INPUT_PULLDOWN);
   pinMode(BUTTON_D2, INPUT_PULLDOWN);
 
@@ -326,24 +322,16 @@ void loop() {
     lastSensorRead = currentMillis;
     forceDisplayRefresh = true;  // Refresh display when new data arrives
 
-    // Update hyperdrive state (only if not in Power Save mode)
+    // Update hyperdrive state (only if not in ECO mode)
     if (currentDisplayMode != MODE_ECO) {
       updateHyperdrive();
     } else if (hyperdriveActive) {
-      // Disable hyperdrive in Power Save mode
+      // Disable hyperdrive in ECO mode
       hyperdriveActive = false;
       hyperdriveStableCount = 0;
-      Serial.println("Hyperdrive disabled (Power Save mode)");
+      Serial.println("Hyperdrive disabled (ECO mode)");
     }
 
-    // In Power Save mode, turn on display briefly if threshold exceeded
-    if (currentDisplayMode == MODE_ECO && currentCO2 >= CO2_THRESHOLD_HIGH) {
-      Serial.printf("CO2 threshold exceeded (%d >= %d), waking display\n", currentCO2, CO2_THRESHOLD_HIGH);
-      lastDisplayActivity = currentMillis;
-      if (!displayOn) {
-        setDisplayPower(true);
-      }
-    }
   }
 
   // Update history for graph at regular intervals
@@ -352,40 +340,14 @@ void loop() {
     lastGraphSample = currentMillis;
   }
 
-  // Handle display power in Power Save mode
-  if (currentDisplayMode == MODE_ECO) {
-    unsigned long timeSinceActivity = currentMillis - lastDisplayActivity;
-    bool shouldBeOn = timeSinceActivity < DISPLAY_TIMEOUT;
-    if (shouldBeOn != displayOn) {
-      Serial.printf("Power Save: timeSinceActivity=%lu, shouldBeOn=%d, displayOn=%d\n",
-                    timeSinceActivity, shouldBeOn, displayOn);
-      setDisplayPower(shouldBeOn);
-    }
-  }
-
   // Update display (smart refresh - only redraws when values change)
   if (displayOn) {
     updateDisplay();
     forceDisplayRefresh = false;
   }
 
-  // When display is off in ECO mode, use longer delay but check buttons periodically
-  // Light sleep removed due to ESP32-S3 reliability issues
-  // Power is still saved via: CPU 80MHz (~35mA), ST7789 sleep (~6mA), SCD41 single shot (~14mA)
-  if (!displayOn && currentDisplayMode == MODE_ECO) {
-    // Check for button press every 100ms during the 1-second delay
-    for (int i = 0; i < 10; i++) {
-      delay(100);
-      // Quick button check - if any button pressed, break out and handle it
-      if (digitalRead(BUTTON_D0) == LOW ||
-          digitalRead(BUTTON_D1) == HIGH ||
-          digitalRead(BUTTON_D2) == HIGH) {
-        break;
-      }
-    }
-  } else {
-    delay(100);   // Normal 100ms delay
-  }
+  // Normal delay when not in deep sleep mode
+  delay(100);
 }
 
 // =============================================================================
@@ -400,7 +362,7 @@ void initDisplay() {
 
   // Enable backlight with PWM (start at full brightness)
   pinMode(TFT_BACKLITE, OUTPUT);
-  analogWrite(TFT_BACKLITE, BRIGHTNESS_HIGH);
+  analogWrite(TFT_BACKLITE, BRIGHTNESS_DAY);
 
   // Initialize ST7789 240x135 display
   tft.init(135, 240);
@@ -448,6 +410,11 @@ void initSensor() {
 
   // SCD41 default I2C address is 0x62
   scd4x.begin(Wire);
+
+  // Wake sensor first - it may be in powerDown state from a previous run
+  // (reflashing the ESP32 doesn't cut power to the sensor)
+  scd4x.wakeUp();
+  delay(30);
 
   // Stop any previous measurements (required before configuration)
   uint16_t error = scd4x.stopPeriodicMeasurement();
@@ -1383,29 +1350,15 @@ void handleButtons() {
   static bool button2Handled = false;
 
   // Button D0 - Cycle through display values (CO2 -> Temp -> Humidity)
-  // In Power Save mode, D0 only wakes/resets timeout (never cycles values)
   bool button0Pressed = (digitalRead(BUTTON_D0) == LOW);
   if (button0Pressed) {
     if (!button0Handled && (currentMillis - lastButtonPress[0] >= DEBOUNCE_DELAY)) {
       lastButtonPress[0] = currentMillis;
       button0Handled = true;
-
-      if (currentDisplayMode == MODE_ECO) {
-        // Power Save mode: D0 only wakes display or resets timeout
-        lastDisplayActivity = currentMillis;
-        if (!displayOn) {
-          setDisplayPower(true);
-          Serial.println("Button D0: Wake display");
-        } else {
-          Serial.println("Button D0: Reset display timeout");
-        }
-      } else {
-        // Normal modes: D0 cycles display value
-        currentDisplayValue = (DisplayValue)((currentDisplayValue + 1) % DISPLAY_VALUE_COUNT);
-        lastDisplayActivity = currentMillis;
-        forceDisplayRefresh = true;
-        Serial.printf("Display value: %s\n", getDisplayValueName(currentDisplayValue));
-      }
+      currentDisplayValue = (DisplayValue)((currentDisplayValue + 1) % DISPLAY_VALUE_COUNT);
+      lastDisplayActivity = currentMillis;
+      forceDisplayRefresh = true;
+      Serial.printf("Display value: %s\n", getDisplayValueName(currentDisplayValue));
     }
   } else {
     button0Handled = false;
@@ -1449,9 +1402,11 @@ void handleButtons() {
 
       // Set brightness based on new mode
       if (currentDisplayMode == MODE_DAY) {
-        setDisplayBrightness(BRIGHTNESS_HIGH);
+        setDisplayBrightness(BRIGHTNESS_DAY);
       } else if (currentDisplayMode == MODE_NIGHT) {
-        setDisplayBrightness(BRIGHTNESS_DIM);
+        setDisplayBrightness(BRIGHTNESS_NIGHT);
+      } else {
+        setDisplayBrightness(BRIGHTNESS_ECO);
       }
 
       // Switch sensor mode when entering/exiting ECO mode
@@ -1459,11 +1414,6 @@ void handleButtons() {
         setSensorMode(true);  // Enter single shot mode
       } else if (currentDisplayMode != MODE_ECO && previousMode == MODE_ECO) {
         setSensorMode(false); // Return to periodic mode
-      }
-
-      // Ensure display is on when changing modes
-      if (!displayOn) {
-        setDisplayPower(true);
       }
     }
   } else {
@@ -1489,11 +1439,11 @@ void setDisplayPower(bool on) {
     tft.fillScreen(COLOR_BLACK);
     int brightness;
     if (currentDisplayMode == MODE_NIGHT) {
-      brightness = BRIGHTNESS_DIM;
+      brightness = BRIGHTNESS_NIGHT;
     } else if (currentDisplayMode == MODE_ECO) {
-      brightness = BRIGHTNESS_DIM;  // Use dim brightness when waking in ECO
+      brightness = BRIGHTNESS_ECO;
     } else {
-      brightness = BRIGHTNESS_HIGH;
+      brightness = BRIGHTNESS_DAY;
     }
     analogWrite(TFT_BACKLITE, brightness);
     lastDisplayActivity = millis();  // Reset timeout when display turns on
@@ -1650,42 +1600,4 @@ void updateHyperdrive() {
 
   // Update baseline for next comparison
   lastHyperdriveCO2 = currentCO2;
-}
-
-void enterLightSleep(unsigned long duration_ms) {
-  if (duration_ms < 100) return;  // Don't sleep for very short periods
-
-  Serial.printf("Entering light sleep for %lu ms\n", duration_ms);
-  Serial.flush();  // Ensure message is printed before sleep
-
-  // Configure wake sources
-  // Wake on button press (GPIO 0 goes LOW when pressed)
-  esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);  // Wake when GPIO 0 is LOW
-
-  // Wake on timer
-  esp_sleep_enable_timer_wakeup(duration_ms * 1000);  // Convert to microseconds
-
-  // Enter light sleep
-  esp_light_sleep_start();
-
-  // After waking up
-  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
-
-  if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) {
-    // Verify button is actually pressed (filter out GPIO noise)
-    delay(50);  // Debounce delay
-    if (digitalRead(BUTTON_D0) == LOW) {
-      Serial.println("Woke up from button press");
-      unsigned long now = millis();
-      lastDisplayActivity = now;
-      lastButtonPress[0] = now;
-      if (!displayOn) {
-        setDisplayPower(true);
-      }
-    } else {
-      Serial.println("Woke up from EXT0 noise (ignored)");
-    }
-  } else if (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) {
-    Serial.println("Woke up from timer");
-  }
 }
