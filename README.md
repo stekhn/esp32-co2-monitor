@@ -120,8 +120,12 @@ Edit the `#define` values at the top of `src/main.cpp`:
 #define HYPERDRIVE_THRESHOLD       100     // CO2 ppm change to trigger
 #define HYPERDRIVE_STABLE_COUNT    3       // Stable readings to exit
 
+// Battery protection
+#define BATTERY_SHUTDOWN_VOLTAGE   3.30    // Shut down below this cell voltage
+#define BATTERY_RECOVER_VOLTAGE    3.60    // Resume above this cell voltage
+
 // Sensor
-#define SCD41_TEMPERATURE_OFFSET   1.5     // Self-heating compensation (C)
+#define SCD41_TEMPERATURE_OFFSET   4.5     // Self-heating compensation (C)
 #define SCD41_ALTITUDE             525     // Altitude for pressure correction (m)
 ```
 
@@ -130,6 +134,7 @@ Edit the `#define` values at the top of `src/main.cpp`:
 - **"Sensor Error" on startup:** Press the reset button. Check STEMMA QT cable connection. Try a different cable.
 - **Readings seem incorrect:** SCD-41 needs ~30s warmup. Keep sensor away from direct breath and heat sources.
 - **Battery shows "USB":** Normal when running on USB power without a LiPo battery connected.
+- **"Battery low", then the display stays off:** The device shuts down below 3.3 V to protect the LiPo. Connect USB; it restarts on its own once the battery is above 3.6 V (checked every 30 minutes, or immediately when pressing D1 or D2). The history graph is reset.
 - **Hyperdrive not activating:** Disabled in ECO mode. Requires >=100 ppm change between readings.
 - **Deep sleep not working:** USB Serial/JTAG can interfere with deep sleep on ESP32-S3. Disconnect serial monitor for accurate power measurements.
 

@@ -89,6 +89,14 @@
 #define CPU_FREQ_ACTIVE            160           // MHz when display is on
 #define CPU_FREQ_SENSOR            80            // MHz for sensor-only wakes
 
+// Battery Protection (cell voltage in volts, measured by MAX17048)
+#define BATTERY_SHUTDOWN_VOLTAGE   3.30   // Shut down below this voltage to protect the LiPo
+#define BATTERY_RECOVER_VOLTAGE    3.60   // Resume only above this voltage (hysteresis, prevents boot loops)
+#define BATTERY_VALID_MIN_VOLTAGE  2.50   // Readings below this are treated as invalid (no battery / I2C error)
+#define BATTERY_CHECK_INTERVAL     60000  // Check battery every minute while running
+#define BATTERY_CHECK_SAMPLES      3      // Consecutive low readings required to shut down
+#define LOW_BATTERY_SLEEP_US       1800000000ULL  // Re-check battery every 30 minutes while shut down
+
 // EMA Filter Configuration (alpha: 0=max smoothing, 1=no smoothing)
 #define EMA_ALPHA_CO2              0.5    // CO2 changes slowly, moderate smoothing
 #define EMA_ALPHA_TEMPERATURE      0.5    // Temperature is stable, more smoothing
@@ -100,7 +108,7 @@
 #define TREND_THRESHOLD_HUMIDITY   2.0    // % change for humidity trend
 
 // SCD41 Sensor Configuration
-#define SCD41_TEMPERATURE_OFFSET   1.5    // Temperature offset in °C (positive values only, subtracted from reading)
+#define SCD41_TEMPERATURE_OFFSET   4.5    // Temperature offset in °C (positive values only, subtracted from reading)
 #define SCD41_ALTITUDE             525    // Altitude in meters (0 = sea level, set for your location)
 
 // Graph Configuration
@@ -205,6 +213,10 @@ struct RtcState {
 
 RTC_DATA_ATTR RtcState rtc;
 
+// Set while shut down for low battery. Kept outside RtcState so it survives
+// the cold boot memset; cleared automatically on power-on and brownout resets.
+RTC_DATA_ATTR bool lowBatteryShutdown = false;
+
 // Aliases so existing code compiles without renaming every reference
 #define rawCO2              rtc.rawCO2
 #define rawTemperature      rtc.rawTemperature
@@ -248,6 +260,7 @@ bool forceDisplayRefresh = true;
 unsigned long lastSensorRead = 0;
 unsigned long lastGraphSample = 0;
 unsigned long lastDisplayActivity = 0;
+unsigned long lastBatteryCheck = 0;
 unsigned long lastButtonPress[3] = {0, 0, 0};
 
 // Previous values for display update optimization (reset each wake)
@@ -289,6 +302,10 @@ void initPowerSaving();
 void updateHyperdrive();
 void setSensorMode(bool singleShot);
 void enterDeepSleep();
+void enableButtonWake();
+float readBatteryVoltage();
+bool isBatteryBelow(float threshold);
+void enterLowBatterySleep();
 void initDisplayWarm();
 
 // =============================================================================
@@ -323,6 +340,32 @@ void setup() {
   digitalWrite(TFT_I2C_POWER, HIGH);
   delay(10);
 
+  // Initialize battery monitor
+  if (batteryMonitor.begin()) {
+    batteryMonitorAvailable = true;
+    Serial.println("MAX17048 battery monitor initialized");
+  } else {
+    Serial.println("MAX17048 not found, battery display disabled");
+  }
+
+  // Battery protection: check before display and sensor draw any current.
+  // After a low battery shutdown or a brownout reset the battery must reach
+  // the higher recover voltage first, otherwise the load of booting would
+  // drop the voltage again and the device would boot loop.
+  bool needsRecovery = lowBatteryShutdown || (esp_reset_reason() == ESP_RST_BROWNOUT);
+  if (isBatteryBelow(needsRecovery ? BATTERY_RECOVER_VOLTAGE : BATTERY_SHUTDOWN_VOLTAGE)) {
+    enterLowBatterySleep();
+    // Never reached
+  }
+  if (lowBatteryShutdown) {
+    // Battery recovered: sensor was powered off, so start over with a cold boot
+    Serial.println("Battery recovered, restarting");
+    lowBatteryShutdown = false;
+    rtc.magic = 0;
+    warmBoot = false;
+    setCpuFrequencyMhz(CPU_FREQ_ACTIVE);
+  }
+
   if (!warmBoot) {
     // ==================== COLD BOOT ====================
     Serial.printf("ESP32-S3 CO2 Monitor v%s Cold Start (CPU: %d MHz)\n",
@@ -340,14 +383,6 @@ void setup() {
 
     // Initialize sensor (full config)
     initSensor();
-
-    // Initialize battery monitor
-    if (batteryMonitor.begin()) {
-      batteryMonitorAvailable = true;
-      Serial.println("MAX17048 battery monitor initialized");
-    } else {
-      Serial.println("MAX17048 not found, battery display disabled");
-    }
 
     // Wait for first valid sensor reading
     Serial.println("Waiting for first sensor reading...");
@@ -371,11 +406,6 @@ void setup() {
     sensorSingleShotMode = true;  // Always in ECO mode during deep sleep
     Wire.begin();
     scd4x.begin(Wire);
-
-    // Re-initialize battery monitor
-    if (batteryMonitor.begin()) {
-      batteryMonitorAvailable = true;
-    }
 
     // Read sensor (single-shot)
     readSensor();
@@ -405,6 +435,23 @@ void setup() {
 void loop() {
   // Handle button input
   handleButtons();
+
+  // Battery protection: shut down before the battery is fully drained
+  if (millis() - lastBatteryCheck >= BATTERY_CHECK_INTERVAL) {
+    lastBatteryCheck = millis();
+    if (isBatteryBelow(BATTERY_SHUTDOWN_VOLTAGE)) {
+      if (displayOn) {
+        tft.fillScreen(COLOR_BLACK);
+        tft.setTextColor(COLOR_RED);
+        tft.setTextSize(2);
+        tft.setCursor(54, 60);
+        tft.print("Battery low");
+        delay(3000);
+      }
+      enterLowBatterySleep();
+      // Never reached
+    }
+  }
 
   // ECO mode: display timeout -> deep sleep
   if (currentDisplayMode == MODE_ECO && displayOn) {
@@ -1235,6 +1282,29 @@ int getBatteryPercent() {
   return -1;  // No battery monitor available
 }
 
+float readBatteryVoltage() {
+  // Returns NAN if no plausible reading is available (no monitor, no battery,
+  // I2C error, or MAX17048 not finished with its first conversion after reset)
+  if (!batteryMonitorAvailable) return NAN;
+  for (int attempt = 0; attempt < 10; attempt++) {
+    float voltage = batteryMonitor.cellVoltage();
+    if (!isnan(voltage) && voltage >= BATTERY_VALID_MIN_VOLTAGE) return voltage;
+    delay(25);
+  }
+  return NAN;
+}
+
+bool isBatteryBelow(float threshold) {
+  // Requires several consecutive valid readings below the threshold, so a
+  // single voltage dip or a failed reading never triggers a shutdown
+  for (int i = 0; i < BATTERY_CHECK_SAMPLES; i++) {
+    float voltage = readBatteryVoltage();
+    if (isnan(voltage) || voltage >= threshold) return false;
+    delay(50);
+  }
+  return true;
+}
+
 // =============================================================================
 // GRAPH HELPER FUNCTIONS
 // =============================================================================
@@ -1563,7 +1633,20 @@ void enterDeepSleep() {
   // Configure wake sources
   // Timer: 5 minutes for periodic sensor reads
   esp_sleep_enable_timer_wakeup(DEEP_SLEEP_US);
+  enableButtonWake();
 
+  // Hold I2C power HIGH during sleep so sensor retains calibration state
+  gpio_hold_en((gpio_num_t)TFT_I2C_POWER);
+  gpio_deep_sleep_hold_en();
+
+  Serial.println("Entering deep sleep...");
+  Serial.flush();
+
+  esp_deep_sleep_start();
+  // Execution stops here. Next code to run is setup() after wake.
+}
+
+void enableButtonWake() {
   // EXT1: GPIO 1 (D1) and GPIO 2 (D2), wake on HIGH level
   // GPIO 0 excluded - strapping pin prone to spurious wakes from noise
   uint64_t ext1_mask = (1ULL << BUTTON_D1) | (1ULL << BUTTON_D2);
@@ -1575,16 +1658,32 @@ void enterDeepSleep() {
   rtc_gpio_pullup_dis((gpio_num_t)BUTTON_D1);
   rtc_gpio_pulldown_en((gpio_num_t)BUTTON_D2);
   rtc_gpio_pullup_dis((gpio_num_t)BUTTON_D2);
+}
 
-  // Hold I2C power HIGH during sleep so sensor retains calibration state
+void enterLowBatterySleep() {
+  // Battery protection shutdown: everything off, wake only to re-check the
+  // battery (timer or button). setup() resumes with a cold boot once the
+  // battery is above BATTERY_RECOVER_VOLTAGE, otherwise it sleeps again
+  // before display or sensor are powered.
+  Serial.printf("Battery low (%.2f V), shutting down\n", readBatteryVoltage());
+
+  // Backlight off (display may not be initialized yet, so no SPI commands)
+  pinMode(TFT_BACKLITE, OUTPUT);
+  digitalWrite(TFT_BACKLITE, LOW);
+
+  lowBatteryShutdown = true;
+  rtc.magic = 0;  // Sensor loses power, force full re-init on recovery
+
+  esp_sleep_enable_timer_wakeup(LOW_BATTERY_SLEEP_US);
+  enableButtonWake();
+
+  // Cut power to display, sensor and I2C pull-ups, hold LOW during sleep
+  digitalWrite(TFT_I2C_POWER, LOW);
   gpio_hold_en((gpio_num_t)TFT_I2C_POWER);
   gpio_deep_sleep_hold_en();
 
-  Serial.println("Entering deep sleep...");
   Serial.flush();
-
   esp_deep_sleep_start();
-  // Execution stops here. Next code to run is setup() after wake.
 }
 
 void initDisplayWarm() {
