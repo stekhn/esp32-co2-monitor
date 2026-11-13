@@ -108,7 +108,7 @@
 #define TREND_THRESHOLD_HUMIDITY   2.0    // % change for humidity trend
 
 // SCD41 Sensor Configuration
-#define SCD41_TEMPERATURE_OFFSET   4.5    // Temperature offset in °C (positive values only, subtracted from reading)
+#define SCD41_TEMPERATURE_OFFSET   7.4    // Temperature offset in °C (positive values only, subtracted from reading)
 #define SCD41_ALTITUDE             525    // Altitude in meters (0 = sea level, set for your location)
 
 // Graph Configuration

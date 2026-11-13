@@ -125,7 +125,7 @@ Edit the `#define` values at the top of `src/main.cpp`:
 #define BATTERY_RECOVER_VOLTAGE    3.60    // Resume above this cell voltage
 
 // Sensor
-#define SCD41_TEMPERATURE_OFFSET   4.5     // Self-heating compensation (C)
+#define SCD41_TEMPERATURE_OFFSET   7.4     // Self-heating compensation (C)
 #define SCD41_ALTITUDE             525     // Altitude for pressure correction (m)
 ```
 
